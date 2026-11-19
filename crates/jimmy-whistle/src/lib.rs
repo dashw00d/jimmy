@@ -131,6 +131,12 @@ impl Whistle {
         );
         let weights = read()?;
         let api = Api::open()?;
+        if let Some(threads) = std::env::var("JIMMY_WHISTLE_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+        {
+            unsafe { (api.set_threads)(threads) };
+        }
         // The backing bytes live as long as the loaded process-wide runtime.
         let status = unsafe { (api.load)(weights.as_ptr(), weights.len() as u64) };
         if status < 0 {

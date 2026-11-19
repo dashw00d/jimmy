@@ -380,6 +380,9 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             ClientEvent::SpeakStop { turn } if self.accepts(turn) => {
                 if self.is_speaking() || self.chunker.buffered() > 0 {
                     self.end_speak(EndReason::Cancelled);
+                    if !self.settings.echo_cancelled {
+                        self.listen_afresh();
+                    }
                 }
                 self.clear_speech();
             }
@@ -404,6 +407,16 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
 
     pub fn is_speaking(&self) -> bool {
         self.speaking || !self.speak.is_empty()
+    }
+
+    /// Whether `pull_audio` has speech to give or to wait for. When it does
+    /// not, the next pull moves on: it ends a flushed reply or reaches a cue.
+    /// A host that queues speech ahead of the speaker holds that pull back
+    /// until its queue has played out.
+    pub fn speech_ready(&self) -> bool {
+        self.stream.is_some()
+            || !self.output.is_empty()
+            || matches!(self.speak.front(), Some(SpeakItem::Text(..)))
     }
 
     /// Retire a failed reply while keeping any active microphone turn open.
@@ -827,6 +840,22 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
         self.followup = 0;
         self.pre_roll.clear();
         self.frame.clear();
+    }
+
+    /// Forgets what the microphone made of the reply that was just stopped.
+    ///
+    /// Without echo cancellation it heard the reply itself, and may be part way
+    /// through that as an utterance, or waiting for half a second of quiet
+    /// after one. Either would swallow a wake phrase said straight after the
+    /// stop. The last moments are kept as lead-in, in case the person had
+    /// already begun to speak.
+    fn listen_afresh(&mut self) {
+        self.wait_silence = None;
+        if let Some(utterance) = self.utterance.take_if(|utterance| utterance.wake_required) {
+            let lead = utterance.audio.len().saturating_sub(PRE_ROLL);
+            self.pre_roll.clear();
+            self.pre_roll.extend(&utterance.audio[lead..]);
+        }
     }
 
     fn end_speak(&mut self, reason: EndReason) {

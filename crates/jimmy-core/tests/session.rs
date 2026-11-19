@@ -403,6 +403,158 @@ fn followup_after_speech_opens_without_wake_phrase() {
     );
 }
 
+/// Pulls everything the session has synthesized, the way a host does that
+/// queues speech ahead of its speaker.
+fn pull_ahead(session: &mut Session<Recognizer, Synth, Detector>) -> usize {
+    let mut pulled = 0;
+    while session.speech_ready() {
+        pulled += session.pull_audio(&mut [0; 480]);
+    }
+    pulled
+}
+
+#[test]
+fn a_host_that_queues_speech_ahead_holds_the_end_until_it_has_played() {
+    let mut session = Session::with_vad(
+        Recognizer::default(),
+        Synth::default(),
+        Detector,
+        Settings::default(),
+    );
+    events(&mut session);
+    speak(&mut session, "One sentence here. And a second one.", None);
+    assert!(session.speech_ready());
+    assert_eq!(pull_ahead(&mut session), 2 * 3 * 960);
+
+    // Everything is synthesized, but the host is still playing it.
+    assert!(session.is_speaking());
+    let all = events(&mut session);
+    assert!(matches!(all.as_slice(), [ServerEvent::SpeakStart { .. }]));
+    // The microphone hears the reply, so speech without the wake phrase
+    // must not open a turn yet.
+    session.push_audio(&[1; 16_000]);
+    session.push_audio(&[0; 16_000]);
+    assert!(events(&mut session).is_empty());
+
+    // The host's queue has played out: the next pull ends the reply.
+    assert_eq!(session.pull_audio(&mut [0; 480]), 0);
+    let all = events(&mut session);
+    assert!(matches!(
+        all.as_slice(),
+        [ServerEvent::SpeakEnd {
+            reason: EndReason::Done,
+            ..
+        }]
+    ));
+    assert!(!session.is_speaking());
+}
+
+#[test]
+fn stop_cancels_a_reply_that_is_synthesized_but_not_yet_played() {
+    let mut session = Session::with_vad(
+        Recognizer::default(),
+        Synth::default(),
+        Detector,
+        Settings::default(),
+    );
+    speak(&mut session, "One sentence here. And a second one.", None);
+    pull_ahead(&mut session);
+    events(&mut session);
+    let revision = session.playback_revision();
+
+    session.push_event(ClientEvent::SpeakStop { turn: None });
+    // The new revision is what tells the host to drop its queue.
+    assert_ne!(session.playback_revision(), revision);
+    let all = events(&mut session);
+    assert!(matches!(
+        all.as_slice(),
+        [ServerEvent::SpeakEnd {
+            reason: EndReason::Cancelled,
+            ..
+        }]
+    ));
+    assert!(!session.is_speaking());
+    assert_eq!(session.pull_audio(&mut [0; 480]), 0);
+    assert!(events(&mut session).is_empty());
+}
+
+#[test]
+fn a_wake_phrase_straight_after_a_stop_is_heard() {
+    // The microphone hears the reply through the speaker. Five wake passes
+    // fail on it, then Jimmy waits for half a second of quiet.
+    let stt = Recognizer {
+        replies: std::iter::repeat_n(Transcript::default(), 5)
+            .chain(std::iter::repeat_n(
+                transcript("Hey Jimmy what time is it"),
+                8,
+            ))
+            .collect(),
+        ..Recognizer::default()
+    };
+    let lengths = stt.lengths.clone();
+    let mut session = Session::with_vad(stt, Synth::default(), Detector, Settings::default());
+    speak(
+        &mut session,
+        "A long reply that the microphone can hear.",
+        None,
+    );
+    assert!(session.pull_audio(&mut [0; 480]) > 0);
+    session.push_audio(&[1; 16_000 * 3]);
+    assert_eq!(lengths.borrow().len(), 5);
+    events(&mut session);
+
+    // The person stops the reply and speaks at once, with no quiet between.
+    session.push_event(ClientEvent::SpeakStop { turn: None });
+    session.push_audio(&[1; 16_000 * 2]);
+    session.push_audio(&[0; 16_000]);
+    let all = events(&mut session);
+    assert!(
+        all.iter()
+            .any(|event| matches!(event, ServerEvent::Wake { .. })),
+        "{all:?}"
+    );
+    assert!(all.iter().any(
+        |event| matches!(event, ServerEvent::Final { transcript, .. } if transcript.text == "what time is it")
+    ));
+}
+
+#[test]
+fn a_cue_waits_for_the_speech_before_it_to_play() {
+    let mut session = Session::with_vad(
+        Recognizer::default(),
+        Synth::default(),
+        Detector,
+        Settings::default(),
+    );
+    events(&mut session);
+    session.push_event(ClientEvent::SpeakAppend {
+        text: "Finished the build.".into(),
+        turn: None,
+    });
+    session.push_event(ClientEvent::CuePlay {
+        id: "chime".into(),
+        turn: None,
+    });
+    assert_eq!(pull_ahead(&mut session), 3 * 960);
+    // The cue is next. A host that is still playing the speech stops here.
+    assert!(!session.speech_ready());
+    let all = events(&mut session);
+    assert!(matches!(all.as_slice(), [ServerEvent::SpeakStart { .. }]));
+
+    session.pull_audio(&mut [0; 480]);
+    let all = events(&mut session);
+    assert!(matches!(
+        all.as_slice(),
+        [
+            ServerEvent::SpeakEnd {
+                reason: EndReason::Done,
+                ..
+            },
+            ServerEvent::Cue { id, .. }
+        ] if id == "chime"
+    ));
+}
+
 #[test]
 fn markdown_is_filtered_across_chunks_and_cues_follow_speech() {
     let synth = Synth::default();
