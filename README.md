@@ -2,6 +2,14 @@
 
 Jimmy is a local voice gateway. It transcribes speech with Whistle, synthesizes English speech with Phonon 31m, and opens a turn on “Hey Jimmy.” Use the Rust API, a JSONL sidecar, a WebSocket, or the browser package.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dashw00d/jimmy/main/scripts/install.sh | sh
+```
+
+This downloads the latest release for Linux or macOS, checks its SHA-256 and installs `jimmy` to `~/.local/bin`. On Windows, download `jimmy-x86_64-pc-windows-gnullvm.zip` from [Releases](https://github.com/dashw00d/jimmy/releases). Then run `jimmy pull` to fetch the voice models.
+
 ## Build and run
 
 Use Rust 1.99 or later. Linux needs the CPAL ALSA development package and LLVM 21 or newer C++ and C++ ABI static libraries. Set `JIMMY_CXX_LIB_DIR` if those archives are outside the standard LLVM directory. The x64 Linux and Windows builds target x86-64-v3, which includes AVX2.
