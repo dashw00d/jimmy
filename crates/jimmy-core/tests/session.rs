@@ -61,7 +61,7 @@ fn transcript(text: &str) -> Transcript {
     }
 }
 
-fn events(session: &mut Session<Recognizer, Synth, Detector>) -> Vec<ServerEvent> {
+fn events<S: Stt>(session: &mut Session<S, Synth, Detector>) -> Vec<ServerEvent> {
     std::iter::from_fn(|| session.poll()).collect()
 }
 
@@ -198,6 +198,14 @@ fn wake_reply_can_be_disabled_by_the_client() {
     }));
     session.push_audio(&[1; 12_800]);
     session.push_audio(&[0; 9_600]);
+    assert_eq!(session.pull_audio(&mut [0; 480]), 0);
+    // With no reply to prompt them, the person gets time to say the command.
+    assert!(
+        !events(&mut session)
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Final { .. }))
+    );
+    session.push_audio(&[0; 38_400]);
     assert_eq!(session.pull_audio(&mut [0; 480]), 0);
     assert!(events(&mut session).iter().any(|event| matches!(
         event, ServerEvent::Final { transcript, .. } if transcript.text.is_empty()
@@ -460,4 +468,159 @@ fn resampling_is_invariant_to_input_chunks() {
     resampler.finish(&mut split);
     assert_eq!(split.len(), 364);
     assert_eq!(split, contiguous);
+}
+
+/// Hears words from the audio itself: each run of sample value `n` is word `n`.
+struct Spoken;
+const VOCABULARY: [&str; 6] = ["", "Hey", "Jimmy,", "what's", "going", "on?"];
+impl Stt for Spoken {
+    fn transcribe(&mut self, audio: &[i16], _: &Recognition) -> Result<Transcript, String> {
+        let mut words: Vec<Word> = Vec::new();
+        let mut previous = 0;
+        for (index, &sample) in audio.iter().enumerate() {
+            let time = index as f32 / 16_000.0;
+            if sample != previous && sample > 0 {
+                words.push(Word {
+                    text: VOCABULARY[sample as usize].into(),
+                    start: time,
+                    end: time,
+                    probability: 0.95,
+                });
+            }
+            if sample > 0 {
+                words.last_mut().unwrap().end = time;
+            }
+            previous = sample;
+        }
+        let text = words
+            .iter()
+            .map(|word| word.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(Transcript {
+            text,
+            language: "en".into(),
+            words,
+        })
+    }
+}
+
+/// 300 ms of audio per word, so "Hey Jimmy," lasts 600 ms.
+fn say(words: &[i16]) -> Vec<i16> {
+    words.iter().flat_map(|&word| [word; 4_800]).collect()
+}
+
+fn quiet(ms: usize) -> Vec<i16> {
+    vec![0; ms * 16]
+}
+
+const HEY_JIMMY: &[i16] = &[1, 2];
+const WHATS_GOING_ON: &[i16] = &[3, 4, 5];
+const COMMAND: &str = "what's going on?";
+
+fn silent_wake_session() -> Session<Spoken, Synth, Detector> {
+    let mut session = Session::with_vad(Spoken, Synth::default(), Detector, Settings::default());
+    // What Plexa sends to `jimmy pipe`.
+    session.push_event(ClientEvent::Configure(Configure {
+        mode: Some(Mode::Wake),
+        wake: Some("hey jimmy".into()),
+        wake_reply: Some(false),
+        echo_cancelled: Some(false),
+        ..Configure::default()
+    }));
+    session.push_audio(&quiet(300));
+    session
+}
+
+fn wakes_and_finals(all: &[ServerEvent]) -> (Vec<u32>, Vec<(u32, String)>) {
+    let wakes = all
+        .iter()
+        .filter_map(|event| match event {
+            ServerEvent::Wake { turn, .. } => Some(*turn),
+            _ => None,
+        })
+        .collect();
+    let finals = all
+        .iter()
+        .filter_map(|event| match event {
+            ServerEvent::Final { turn, transcript } => Some((*turn, transcript.text.clone())),
+            _ => None,
+        })
+        .collect();
+    (wakes, finals)
+}
+
+#[test]
+fn silent_wake_keeps_the_turn_open_through_a_pause_before_the_command() {
+    let mut session = silent_wake_session();
+    session.push_audio(&say(HEY_JIMMY));
+    session.push_audio(&quiet(1_000));
+    session.push_audio(&say(WHATS_GOING_ON));
+    session.push_audio(&quiet(1_000));
+    let all = events(&mut session);
+    let (wakes, finals) = wakes_and_finals(&all);
+    assert_eq!(wakes, [1]);
+    assert_eq!(finals, [(1, COMMAND.to_owned())], "events: {all:?}");
+    let ends = all
+        .iter()
+        .filter(|event| matches!(event, ServerEvent::SpeechEnd { turn: 1 }))
+        .count();
+    assert_eq!(
+        ends, 1,
+        "one speech segment carries the wake and the command"
+    );
+}
+
+#[test]
+fn silent_wake_without_a_command_finalizes_empty_then_hears_the_next_wake() {
+    let mut session = silent_wake_session();
+    session.push_audio(&say(HEY_JIMMY));
+    session.push_audio(&quiet(3_200));
+    let (wakes, finals) = wakes_and_finals(&events(&mut session));
+    assert_eq!(wakes, [1]);
+    assert_eq!(
+        finals,
+        [(1, String::new())],
+        "a bare wake still ends its turn"
+    );
+
+    // Nothing from the client: the next wake phrase opens a new turn.
+    let mut next = say(HEY_JIMMY);
+    next.extend(say(WHATS_GOING_ON));
+    session.push_audio(&next);
+    session.push_audio(&quiet(1_000));
+    let (wakes, finals) = wakes_and_finals(&events(&mut session));
+    assert_eq!(wakes, [2]);
+    assert_eq!(finals, [(2, COMMAND.to_owned())]);
+}
+
+#[test]
+fn wake_phrase_is_heard_after_other_speech_in_the_same_breath() {
+    let mut session = silent_wake_session();
+    let mut audio = say(WHATS_GOING_ON);
+    audio.extend(quiet(200));
+    audio.extend(say(HEY_JIMMY));
+    audio.extend(say(WHATS_GOING_ON));
+    session.push_audio(&audio);
+    session.push_audio(&quiet(1_000));
+    let all = events(&mut session);
+    let (wakes, finals) = wakes_and_finals(&all);
+    assert_eq!(wakes, [1], "events: {all:?}");
+    assert_eq!(finals, [(1, COMMAND.to_owned())]);
+}
+
+#[test]
+fn pausing_after_each_wake_still_delivers_each_command() {
+    // The Plexa trace: "hey jimmy", a pause, "what's going on", twice.
+    let mut session = silent_wake_session();
+    for _ in 0..2 {
+        session.push_audio(&say(HEY_JIMMY));
+        session.push_audio(&quiet(800));
+        session.push_audio(&say(WHATS_GOING_ON));
+        session.push_audio(&quiet(1_000));
+    }
+    let all = events(&mut session);
+    let (wakes, finals) = wakes_and_finals(&all);
+    assert_eq!(wakes, [1, 2], "events: {all:?}");
+    assert_eq!(finals, [(1, COMMAND.to_owned()), (2, COMMAND.to_owned())]);
 }

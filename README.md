@@ -135,7 +135,9 @@ text to speak ----------------------> Phonon (TTS) --> 24 kHz PCM16 audio
 
 Run `jimmy talk` or `jimmy listen`, say “Hey Jimmy,” and pause. Jimmy rotates through “What's up?”, “How can I help?”, “Go ahead,” and “I'm here” after the default 600 ms silence timeout. Phonon speaks the greeting locally. By default, you have eight seconds after the greeting to ask your question without repeating the wake phrase. If you say “Hey Jimmy, what's the weather?” in one breath, Jimmy transcribes the question directly. `jimmy talk` sends the question to an agent. With `jimmy listen` or the other interfaces, the caller answers.
 
-Use `jimmy listen --wake-reply=false` to keep wake mode silent. Sidecar, WebSocket, and browser clients can set `wake_reply: false` in `session.configure` to supply their own greeting. The option applies in wake mode.
+Use `jimmy listen --wake-reply=false` to keep wake mode silent. Sidecar, WebSocket, and browser clients can set `wake_reply: false` in `session.configure` to supply their own greeting. The option applies in wake mode. Without a spoken reply, Jimmy keeps the turn open for up to 3 seconds of silence after a standalone “Hey Jimmy”, so “Hey Jimmy … what's going on?” arrives as one `transcript.final`. If no command follows, the turn ends with an empty `transcript.final`, the signal to play your own greeting.
+
+The wake phrase is matched anywhere in what Jimmy hears, so “Um, hey Jimmy, …” or a retry right after other speech still wakes it. Words before the phrase are dropped.
 
 ## Talk to an agent
 
