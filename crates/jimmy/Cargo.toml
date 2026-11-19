@@ -1,0 +1,33 @@
+[package]
+name = "jimmy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+jimmy-proto.workspace = true
+jimmy-core.workspace = true
+jimmy-whistle.workspace = true
+jimmy-phonon.workspace = true
+jimmy-audio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+ureq.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.9"
+directories = "6"
+num_cpus = "1"
+axum = { version = "0.8", features = ["ws", "multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+subtle = "2"
+base64 = "0.22"
+ctrlc = "3"
+
+[features]
+opus = ["jimmy-audio/opus"]
+bundled = []
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

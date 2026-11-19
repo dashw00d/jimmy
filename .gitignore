@@ -1,0 +1,51 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Release archives, checksums, and SBOMs from scripts/package.py
+/dist/
+/crates/*/*.cdx.json
+
+# Local settings (may hold a server token or API key)
+/jimmy.toml
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+
+# Web package: dependencies, build output, and the vendor download cache
+/web/node_modules/
+/web/dist/
+/web/vendor/
+/web/wasm/
+/web/*.tgz
+node_modules/
+npm-debug.log*
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Model checkpoints (downloaded to the user cache, or kept in a local --model-dir)
+/models/
+*.cact
+*.safetensors
+
+# Audio and soak files made by `jimmy say -o`, tests, and wake soak runs
+*.wav
+*.raw
+wakes.jsonl
+
+# Logs
+*.log
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

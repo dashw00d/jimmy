@@ -1,0 +1,14 @@
+[package]
+name = "jimmy-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+ts-rs = { version = "11", optional = true, features = ["no-serde-warnings"] }
+
+[features]
+typescript = ["dep:ts-rs"]
+
+[dev-dependencies]
+serde_json.workspace = true

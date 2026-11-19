@@ -1,0 +1,15 @@
+{
+  "name": "jimmy-web",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Jimmy voice I/O for browser Workers and remote WebSockets",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": { "phonon-tts": "0.7.0" },
+  "devDependencies": { "typescript": "5.9.3" },
+  "engines": { "node": ">=22" }
+}

@@ -1,0 +1,108 @@
+name: Build and test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-gnullvm
+          - runner: windows-2025
+            target: aarch64-pc-windows-gnullvm
+            cross: true
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup override set 1.99.0
+          rustup target add "${{ matrix.target }}"
+      - name: ALSA and libc++
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/llvm.sh" https://apt.llvm.org/llvm.sh
+          sudo bash "$RUNNER_TEMP/llvm.sh" 21
+          sudo apt-get install -y libasound2-dev libc++-21-dev libc++abi-21-dev
+      - name: LLVM-MinGW
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "20261117"
+          $file = "llvm-mingw-$version-ucrt-x86_64"
+          Invoke-WebRequest "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$file.zip" -OutFile "$env:RUNNER_TEMP\mingw.zip"
+          Expand-Archive "$env:RUNNER_TEMP\mingw.zip" "$env:RUNNER_TEMP\llvm-mingw"
+          $root = Get-ChildItem "$env:RUNNER_TEMP\llvm-mingw" -Directory | Select-Object -First 1
+          $arch = "${{ matrix.target }}".Split("-")[0]
+          $triple = "${{ matrix.target }}".Replace("-", "_")
+          $compiler = "$($root.FullName)\bin\$arch-w64-mingw32-clang.exe"
+          Add-Content $env:GITHUB_PATH "$($root.FullName)\bin"
+          Add-Content $env:GITHUB_ENV "CARGO_TARGET_$($triple.ToUpperInvariant())_LINKER=$compiler"
+          Add-Content $env:GITHUB_ENV "CC_${triple}=$compiler"
+          Add-Content $env:GITHUB_ENV "AR_${triple}=$($root.FullName)\bin\llvm-ar.exe"
+          Add-Content $env:GITHUB_ENV "JIMMY_CXX_LIB_DIR=$($root.FullName)\$arch-w64-mingw32\lib"
+      - name: Build
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p jimmy
+      - name: Tests
+        if: matrix.cross != true
+        shell: bash
+        run: |
+          cargo test --locked --workspace --target "${{ matrix.target }}"
+          cargo run --locked --target "${{ matrix.target }}" --release -- doctor --json
+      - name: Release archive and SBOM
+        if: matrix.cross != true
+        shell: bash
+        run: |
+          cargo install cargo-cyclonedx --locked --version 0.5.7
+          cargo cyclonedx --manifest-path crates/jimmy/Cargo.toml --format json --target "${{ matrix.target }}"
+          binary="target/${{ matrix.target }}/release/jimmy"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          python scripts/package.py "${{ matrix.target }}" "$binary" crates/jimmy/jimmy.cdx.json
+      - uses: actions/upload-artifact@v4
+        if: matrix.cross != true
+        with:
+          name: jimmy-${{ matrix.target }}
+          path: dist/
+  browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Rust and Wasm
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup override set 1.99.0
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.114 --locked
+      - name: Build and package
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+          npm test
+          npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jimmy-web-npm
+          path: web/jimmy-web-*.tgz

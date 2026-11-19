@@ -1,0 +1,9 @@
+[package]
+name = "jimmy-phonon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+jimmy-core.workspace = true
+anyhow.workspace = true
+ptts = { version = "=0.7.0", features = ["hf"] }

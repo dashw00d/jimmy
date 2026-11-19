@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/jimmy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+jimmy-proto = { path = "crates/jimmy-proto", version = "0.1.0" }
+jimmy-core = { path = "crates/jimmy-core", version = "0.1.0" }
+jimmy-whistle = { path = "crates/jimmy-whistle", version = "0.1.0" }
+jimmy-phonon = { path = "crates/jimmy-phonon", version = "0.1.0" }
+jimmy-audio = { path = "crates/jimmy-audio", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+sha2 = "0.10"
+tempfile = "3"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"

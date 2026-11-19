@@ -1,0 +1,19 @@
+[package]
+name = "jimmy-whistle"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+jimmy-core.workspace = true
+jimmy-proto.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+libloading = "0.8"
+tempfile.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+ureq.workspace = true
+zip = { version = "4", default-features = false, features = ["deflate"] }

@@ -1,0 +1,15 @@
+[package]
+name = "jimmy-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+jimmy-core.workspace = true
+cpal = "=0.18.2"
+rtrb = "0.3"
+hound = "3.5"
+opus = { version = "0.3", optional = true }
+
+[features]
+opus = ["dep:opus"]

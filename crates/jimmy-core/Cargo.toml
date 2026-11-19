@@ -1,0 +1,7 @@
+[package]
+name = "jimmy-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+jimmy-proto.workspace = true
