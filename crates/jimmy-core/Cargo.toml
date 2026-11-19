@@ -2,6 +2,7 @@
 name = "jimmy-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 jimmy-proto.workspace = true

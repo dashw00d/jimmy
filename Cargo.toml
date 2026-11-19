@@ -6,6 +6,7 @@ default-members = ["crates/jimmy"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 jimmy-proto = { path = "crates/jimmy-proto", version = "0.1.0" }

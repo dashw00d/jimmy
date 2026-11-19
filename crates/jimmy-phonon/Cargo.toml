@@ -2,6 +2,7 @@
 name = "jimmy-phonon"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 jimmy-core.workspace = true

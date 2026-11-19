@@ -118,3 +118,7 @@ python scripts/tests/score_soak.py wakes.jsonl markers.txt
 ```
 
 Vendor versions and licenses are recorded in [Third-party engines and checkpoints](THIRD_PARTY.md).
+
+## License
+
+Jimmy is licensed under the [Apache License 2.0](LICENSE). Third-party engines and checkpoints keep their own licenses; see [THIRD_PARTY.md](THIRD_PARTY.md).
