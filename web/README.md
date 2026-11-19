@@ -23,7 +23,7 @@ jimmy.speakAppend('Hello from Jimmy.');
 jimmy.speakFlush();
 ```
 
-Push-to-talk is the default. In wake mode, a standalone “Hey Jimmy” gets a short local greeting after the silence timeout. Set `wake_reply: false` in `configure()` if your application supplies its own greeting. Use `jimmy.configure({ mode: 'wake' })` for wake detection or `mode: 'open'` for continuous listening. Set `microphone: false` when opening playback only. To manage audio yourself, subscribe with `onAudio` and send 16 kHz PCM16 through `pushAudio`. `close()` stops playback and capture and releases the connection.
+Push-to-talk is the default. In wake mode, a standalone “Hey Jimmy” gets a short local greeting after the silence timeout. Set `wake_reply: false` in `configure()` if your application supplies its own greeting. Jimmy then waits up to 3 seconds of silence for a command after the wake phrase and sends an empty `transcript.final` if none comes. Use `jimmy.configure({ mode: 'wake' })` for wake detection or `mode: 'open'` for continuous listening. Set `microphone: false` when opening playback only. To manage audio yourself, subscribe with `onAudio` and send 16 kHz PCM16 through `pushAudio`. `close()` stops playback and capture and releases the connection.
 
 The local engine requires a secure browser context and Wasm SIMD. CPU is the default. Use `ttsDevice: 'webgpu'` to opt in to the vendor's WebGPU TTS engine. AudioWorklet uses shared rings in cross-origin isolated pages and transferred messages otherwise. The local Worker downloads pinned, SHA-256-verified model files. Use `modelBase` to serve the same model files from your own site.
 

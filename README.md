@@ -135,7 +135,22 @@ text to speak ----------------------> Phonon (TTS) --> 24 kHz PCM16 audio
 
 Run `jimmy talk` or `jimmy listen`, say “Hey Jimmy,” and pause. Jimmy rotates through “What's up?”, “How can I help?”, “Go ahead,” and “I'm here” after the default 600 ms silence timeout. Phonon speaks the greeting locally. By default, you have eight seconds after the greeting to ask your question without repeating the wake phrase. If you say “Hey Jimmy, what's the weather?” in one breath, Jimmy transcribes the question directly. `jimmy talk` sends the question to an agent. With `jimmy listen` or the other interfaces, the caller answers.
 
-Use `jimmy listen --wake-reply=false` to keep wake mode silent. Sidecar, WebSocket, and browser clients can set `wake_reply: false` in `session.configure` to supply their own greeting. The option applies in wake mode.
+Use `jimmy listen --wake-reply=false` to keep wake mode silent. Sidecar, WebSocket, and browser clients can set `wake_reply: false` in `session.configure` to supply their own greeting. The option applies in wake mode. Without a spoken reply, Jimmy keeps the turn open for up to 3 seconds of silence after a standalone “Hey Jimmy”, so “Hey Jimmy … what's going on?” arrives as one `transcript.final`. If no command follows, the turn ends with an empty `transcript.final`, the signal to play your own greeting.
+
+The wake phrase is matched anywhere in what Jimmy hears, so “Um, hey Jimmy, …” or a retry right after other speech still wakes it. Words before the phrase are dropped.
+
+## Playback on your speakers
+
+`jimmy talk`, `jimmy pipe` and `jimmy say` play through the default output device. Phonon makes speech at roughly the speed it is spoken, and slower on a busy machine, so Jimmy does not play each sample the moment it exists:
+
+- Synthesis runs ahead of the speaker into a queue of up to eight seconds, across sentence boundaries.
+- A reply starts once about a quarter of a second is queued. A reply shorter than that plays at once.
+- When synthesis falls behind, Jimmy holds open the pauses the speech already has until it has caught up, instead of breaking words apart. If the queue still runs dry, it waits for a reserve before it carries on.
+- `speak.stop`, `cancel` and a wake phrase silence the speaker at once and drop what is queued. `speak.end` is sent when the speaker goes quiet, not when synthesis finishes.
+
+On Linux Jimmy asks the sound server for about 43 ms of audio at a time, with a device buffer of twice that. Set `JIMMY_AUDIO_PERIOD` to a number of frames to change it, or to `0` for the device's default. If an output device still keeps running dry, Jimmy reopens it with a longer period between replies and says so on standard error.
+
+Set `JIMMY_PLAYBACK_LOG=1` to get one line on standard error per reply with the underrun counts, the silence added to pauses, the synthesis speed, and the microphone audio lost. [The device rig](docs/device-rig.md) explains each field.
 
 ## Talk to an agent
 
@@ -214,6 +229,14 @@ python scripts/tests/integration.py target/release/jimmy /path/to/models --brows
 ```
 
 The Python harnesses use `pyarrow`, `websockets`, `playwright`, and FFmpeg. The native conformance test uses ALSA's null device. On other operating systems, pass `--skip-pipe`. Add `--strict-latency` to enforce the desktop WebSocket target. See [test results](TEST_RESULTS.md).
+
+To test `jimmy pipe` through its real microphone and speaker path on Linux, use the device rig. It runs Jimmy on a private PipeWire server with a virtual microphone and speaker, so your own audio is not touched and nothing is audible. It measures breaks in a long spoken reply, `speak.stop` latency, and wake and transcript rates across microphone levels, pauses and background sound. See [the device rig](docs/device-rig.md).
+
+```sh
+python3 scripts/tests/device_rig.py playback target/release/jimmy --load 16
+python3 scripts/tests/device_rig.py stop target/release/jimmy
+python3 scripts/tests/device_rig.py wake target/release/jimmy
+```
 
 To score a recorded wake soak, prepare a continuous audio file with known wake phrases and put each start time in seconds on a separate line in `markers.txt`.
 

@@ -90,7 +90,10 @@ impl AudioStream for Stream {
             let (text, options) = self.request.take().expect("pending speech");
             let synth = self.model.synth.clone();
             let ended = self.ended.clone();
-            let (tx, rx) = mpsc::sync_channel(1);
+            // Room for about 2.5 s of frames, so synthesis keeps going while
+            // the session thread is busy with something else, such as a
+            // transcription.
+            let (tx, rx) = mpsc::sync_channel(32);
             // The session can drop rx immediately on cancel. The vendor's own
             // cleanup joins on this thread before its CPU slot is released.
             std::thread::Builder::new()

@@ -16,6 +16,9 @@ const FRAME: usize = 320;
 const PRE_ROLL: usize = 4_800;
 const MAX_UTTERANCE: usize = 25 * INPUT_RATE as usize;
 const MAX_QUEUED_TEXT: usize = 64 * 1024;
+/// Silence after a bare wake phrase that Jimmy waits through for the command
+/// when it will not speak a wake reply.
+const COMMAND_WAIT_MS: u32 = 3_000;
 const WAKE_REPLIES: &[&str] = &["What's up?", "How can I help?", "Go ahead.", "I'm here."];
 
 #[derive(Debug, Default, Clone)]
@@ -145,6 +148,10 @@ struct Utterance {
     next_pass: usize,
     wake_required: bool,
     wake_match: Option<(String, f32)>,
+    /// Silence heard since a bare wake phrase while waiting for the command.
+    /// Those frames are not kept, so the command follows the phrase closely.
+    awaiting_command: Option<usize>,
+    waited: bool,
     agreement: Agreement,
 }
 
@@ -157,6 +164,8 @@ impl Utterance {
             next_pass: samples(if wake_required { 800 } else { partial_ms }),
             wake_required,
             wake_match: None,
+            awaiting_command: None,
+            waited: false,
             agreement: Agreement::default(),
         }
     }
@@ -164,15 +173,19 @@ impl Utterance {
     fn command_words(&self, transcript: &Transcript) -> Vec<Word> {
         let mut words = word_list(transcript);
         if let Some((phrase, end)) = &self.wake_match {
-            let count = wake_prefix(phrase, &words).map_or_else(
-                || {
-                    words
-                        .iter()
-                        .take_while(|word| (word.start + word.end) * 0.5 < *end)
-                        .count()
-                },
-                |matched| matched.count,
-            );
+            // Drop the wake phrase and anything said before it. A later
+            // occurrence of the phrase belongs to the command.
+            let count = find_wake(phrase, &words)
+                .filter(|matched| words[matched.index].start <= *end)
+                .map_or_else(
+                    || {
+                        words
+                            .iter()
+                            .take_while(|word| (word.start + word.end) * 0.5 < *end)
+                            .count()
+                    },
+                    |matched| matched.index + matched.count,
+                );
             words.drain(..count);
         }
         words
@@ -367,6 +380,9 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             ClientEvent::SpeakStop { turn } if self.accepts(turn) => {
                 if self.is_speaking() || self.chunker.buffered() > 0 {
                     self.end_speak(EndReason::Cancelled);
+                    if !self.settings.echo_cancelled {
+                        self.listen_afresh();
+                    }
                 }
                 self.clear_speech();
             }
@@ -391,6 +407,16 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
 
     pub fn is_speaking(&self) -> bool {
         self.speaking || !self.speak.is_empty()
+    }
+
+    /// Whether `pull_audio` has speech to give or to wait for. When it does
+    /// not, the next pull moves on: it ends a flushed reply or reaches a cue.
+    /// A host that queues speech ahead of the speaker holds that pull back
+    /// until its queue has played out.
+    pub fn speech_ready(&self) -> bool {
+        self.stream.is_some()
+            || !self.output.is_empty()
+            || matches!(self.speak.front(), Some(SpeakItem::Text(..)))
     }
 
     /// Retire a failed reply while keeping any active microphone turn open.
@@ -575,6 +601,25 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             }
         }
         let utterance = self.utterance.as_mut().expect("speech onset");
+        if let Some(silence) = &mut utterance.awaiting_command {
+            if !voiced {
+                *silence += FRAME;
+                if *silence < samples(COMMAND_WAIT_MS) {
+                    if self.pre_roll.len() == PRE_ROLL {
+                        self.pre_roll.drain(..FRAME);
+                    }
+                    self.pre_roll.extend(frame);
+                } else {
+                    utterance.awaiting_command = None;
+                    self.finish_speech(true);
+                }
+                return;
+            }
+            utterance.awaiting_command = None;
+            utterance.elapsed += self.pre_roll.len();
+            utterance.audio.extend(self.pre_roll.drain(..));
+            utterance.next_pass = utterance.elapsed + samples(self.settings.partial_ms);
+        }
         utterance.audio.extend_from_slice(frame);
         utterance.elapsed += FRAME;
         utterance.silence = if voiced { 0 } else { utterance.silence + FRAME };
@@ -616,7 +661,7 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             .stt
             .transcribe(&utterance.audio, &self.settings.recognition);
         if let Ok(transcript) = &result
-            && let Some(matched) = wake_prefix(&self.settings.wake, &transcript.words)
+            && let Some(matched) = find_wake(&self.settings.wake, &transcript.words)
         {
             if self.open {
                 self.cancel();
@@ -677,39 +722,62 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
     }
 
     fn finish_speech(&mut self, endpoint: bool) {
-        let Some(utterance) = self.utterance.take() else {
+        let Some(mut utterance) = self.utterance.take() else {
             return;
         };
         if utterance.wake_required {
             return;
         }
-        self.events
-            .push_back(ServerEvent::SpeechEnd { turn: self.turn });
         let wake = utterance.wake_match.is_some();
         let trim = if wake {
             utterance.silence.saturating_sub(samples(100))
         } else {
             0
         };
-        let audio = &utterance.audio[..utterance.audio.len().saturating_sub(trim)];
-        match self.stt.transcribe(audio, &self.settings.recognition) {
-            Ok(mut transcript) => {
+        let kept = utterance.audio.len().saturating_sub(trim);
+        let result = self
+            .stt
+            .transcribe(&utterance.audio[..kept], &self.settings.recognition)
+            .map(|mut transcript| {
                 let words = utterance.command_words(&transcript);
-                transcript.words = utterance.agreement.finish(words);
-                if wake
-                    && endpoint
-                    && transcript.words.is_empty()
-                    && self.settings.wake_reply
-                    && self.tts.available()
-                    && !self.is_speaking()
-                    && self.chunker.buffered() == 0
-                {
-                    let reply = WAKE_REPLIES[self.next_wake_reply];
-                    self.next_wake_reply = (self.next_wake_reply + 1) % WAKE_REPLIES.len();
-                    self.enqueue_speech(reply.into());
-                    self.flush = true;
-                    return;
-                }
+                transcript.words = std::mem::take(&mut utterance.agreement).finish(words);
+                transcript
+            });
+        let bare_wake = wake
+            && endpoint
+            && result
+                .as_ref()
+                .is_ok_and(|transcript| transcript.words.is_empty());
+        let wake_reply = bare_wake
+            && self.settings.wake_reply
+            && self.tts.available()
+            && !self.is_speaking()
+            && self.chunker.buffered() == 0;
+        if bare_wake
+            && !wake_reply
+            && !utterance.waited
+            && utterance.silence < samples(COMMAND_WAIT_MS)
+        {
+            // Without a spoken reply nothing tells the person to go on, and
+            // people pause after a wake phrase. Keep the turn for the command.
+            utterance.audio.truncate(kept);
+            utterance.awaiting_command = Some(utterance.silence);
+            utterance.silence = utterance.silence.min(samples(100));
+            utterance.waited = true;
+            self.pre_roll.clear();
+            self.utterance = Some(utterance);
+            return;
+        }
+        self.events
+            .push_back(ServerEvent::SpeechEnd { turn: self.turn });
+        match result {
+            Ok(_) if wake_reply => {
+                let reply = WAKE_REPLIES[self.next_wake_reply];
+                self.next_wake_reply = (self.next_wake_reply + 1) % WAKE_REPLIES.len();
+                self.enqueue_speech(reply.into());
+                self.flush = true;
+            }
+            Ok(mut transcript) => {
                 transcript.text = words_text(&transcript.words);
                 self.events.push_back(ServerEvent::Final {
                     turn: self.turn,
@@ -772,6 +840,22 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
         self.followup = 0;
         self.pre_roll.clear();
         self.frame.clear();
+    }
+
+    /// Forgets what the microphone made of the reply that was just stopped.
+    ///
+    /// Without echo cancellation it heard the reply itself, and may be part way
+    /// through that as an utterance, or waiting for half a second of quiet
+    /// after one. Either would swallow a wake phrase said straight after the
+    /// stop. The last moments are kept as lead-in, in case the person had
+    /// already begun to speak.
+    fn listen_afresh(&mut self) {
+        self.wait_silence = None;
+        if let Some(utterance) = self.utterance.take_if(|utterance| utterance.wake_required) {
+            let lead = utterance.audio.len().saturating_sub(PRE_ROLL);
+            self.pre_roll.clear();
+            self.pre_roll.extend(&utterance.audio[lead..]);
+        }
     }
 
     fn end_speak(&mut self, reason: EndReason) {
@@ -842,34 +926,45 @@ fn normalized(word: &str) -> String {
         .collect()
 }
 
-struct WakePrefix {
+struct WakeMatch {
+    index: usize,
     count: usize,
     end: f32,
     confidence: f32,
 }
 
-fn wake_prefix(phrase: &str, words: &[Word]) -> Option<WakePrefix> {
+/// Finds the first occurrence of the wake phrase. Speech just before it, such
+/// as "um" or an unanswered sentence, must not hide it.
+fn find_wake(phrase: &str, words: &[Word]) -> Option<WakeMatch> {
     let wanted: Vec<_> = phrase
         .split_whitespace()
         .map(normalized)
         .filter(|word| !word.is_empty())
         .collect();
-    let prefix = words.get(..wanted.len())?;
-    let mut probability = 1.0f32;
-    for (target, word) in wanted.iter().zip(prefix) {
-        let heard = normalized(&word.text);
-        let alias = matches!(
-            (target.as_str(), heard.as_str()),
-            ("hey", "hay") | ("jimmy", "jimmie")
-        );
-        if target != &heard && !alias {
-            return None;
-        }
-        probability = probability.min(word.probability);
+    if wanted.is_empty() {
+        return None;
     }
-    Some(WakePrefix {
-        count: prefix.len(),
-        end: prefix.last()?.end.max(0.0),
-        confidence: probability,
-    })
+    words
+        .windows(wanted.len())
+        .enumerate()
+        .find_map(|(index, heard)| {
+            let mut probability = 1.0f32;
+            for (target, word) in wanted.iter().zip(heard) {
+                let spoken = normalized(&word.text);
+                let alias = matches!(
+                    (target.as_str(), spoken.as_str()),
+                    ("hey", "hay") | ("jimmy", "jimmie")
+                );
+                if target != &spoken && !alias {
+                    return None;
+                }
+                probability = probability.min(word.probability);
+            }
+            Some(WakeMatch {
+                index,
+                count: wanted.len(),
+                end: heard.last()?.end.max(0.0),
+                confidence: probability,
+            })
+        })
 }

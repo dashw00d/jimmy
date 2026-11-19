@@ -1063,7 +1063,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "jimmy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "jimmy-audio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cpal",
@@ -1102,14 +1102,14 @@ dependencies = [
 
 [[package]]
 name = "jimmy-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jimmy-proto",
 ]
 
 [[package]]
 name = "jimmy-phonon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "jimmy-core",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "jimmy-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "jimmy-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jimmy-core",
  "jimmy-proto",
@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "jimmy-whistle"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "jimmy-core",
