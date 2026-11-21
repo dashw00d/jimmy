@@ -1,6 +1,6 @@
 {
   "name": "jimmy-web",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Jimmy voice I/O for browser Workers and remote WebSockets",
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },

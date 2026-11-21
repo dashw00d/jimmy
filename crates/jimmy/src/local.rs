@@ -298,7 +298,6 @@ pub fn run(
                 Ok(Input::Event(mut event)) => {
                     if let ClientEvent::Configure(config) = &mut event {
                         config.input_rate = Some(capture.rate);
-                        config.echo_cancelled = Some(false);
                     }
                     stopped |= stops_speech(&event);
                     session.push_event(event);
@@ -483,11 +482,15 @@ pub fn run(
         // The microphone comes last. Hearing can mean a transcription, which
         // keeps this thread for a while, and a stop that arrived meanwhile
         // should be the first thing dealt with after it.
+        let mut mic_full = false;
         if !eof {
             let frames = capture.read(&mut mic)?;
+            mic_full = frames == mic.len();
             session.push_audio(&mic[..frames]);
         }
-        thread::sleep(POLL);
+        if !mic_full {
+            thread::sleep(POLL);
+        }
     }
     Ok(())
 }

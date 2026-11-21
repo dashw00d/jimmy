@@ -147,7 +147,8 @@ def main():
                 heard = expect("You: ", 30)
                 reply = expect("", 150)  # The agent's reply line, such as "Codex: ...".
                 assert ": " in reply and not reply.startswith("You: "), reply
-                speaker.wait_quiet(asked)
+                # Wait for speech from the reply itself, not an earlier "Hmm." filler.
+                speaker.wait_quiet(max(asked, time.monotonic() - 0.8))
                 print(f"  (spoken reply finished {time.monotonic() - asked:.1f}s after the question)", flush=True)
                 clip = temp / f"{name}-reply.wav"
                 speaker.save(start, clip)

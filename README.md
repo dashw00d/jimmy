@@ -202,7 +202,7 @@ The older WebSocket Codex bridge, `scripts/jimmy_codex.py`, still works, and `sc
 
 - `listen` and `pipe` default to wake mode. Use `--mode open` for continuous speech detection or `--mode ptt` for push-to-talk. In interactive `listen --mode ptt`, Enter toggles the microphone turn.
 - `jimmy pipe --cue-dir ./cues` exchanges JSONL on stdin and stdout. Jimmy handles the device and caches WAV cues using the filenames as IDs. On native speakers, use the wake phrase or PTT to interrupt output. A client that has echo cancellation can enable open-mic interruption.
-- `jimmy serve` exposes `/v1/stream`, `POST /v1/audio/speech`, and `POST /v1/audio/transcriptions`. Public binds require a bearer token and an exact origin allowlist. For a public HTTPS service, terminate TLS in front of Jimmy.
+- `jimmy serve` exposes `/v1/stream`, `POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, and `GET /health`. Public binds require a bearer token and an exact origin allowlist. For a public HTTPS service, terminate TLS in front of Jimmy.
 - HTTP speech takes JSON with `input`, optional `voice`, optional `speed`, and `response_format` of `wav` or `pcm`. HTTP transcription takes multipart WAV with optional `language`, `prompt` for keyword boosting, and `response_format` of `json`, `verbose_json`, or `text`.
 - Rust hosts create a `jimmy_core::Session` with implementations of `Stt` and `Tts`. Call `push_audio`, `push_event`, `poll`, and `pull_audio` on the session's worker.
 - See [jimmy-web](web/README.md) for the local Worker and remote WebSocket client.

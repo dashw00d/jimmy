@@ -107,11 +107,33 @@ struct Runtime {
     _weights: Vec<u8>,
 }
 
+struct Scratch {
+    audio: Vec<f32>,
+    out: Vec<u8>,
+}
+
+impl Scratch {
+    const fn new() -> Self {
+        Self {
+            audio: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+}
+
 // The pinned engine exposes one global model and no independent C handles.
 // Serializing calls also protects its scratch space and last-error pointer.
-static RUNTIME: Mutex<()> = Mutex::new(());
+static RUNTIME: Mutex<Scratch> = Mutex::new(Scratch::new());
 static REQUIRED: AtomicUsize = AtomicUsize::new(0);
 static MODEL_STATE: OnceLock<Runtime> = OnceLock::new();
+
+fn configured_threads() -> i32 {
+    std::env::var("JIMMY_WHISTLE_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or(1)
+}
 
 #[derive(Clone, Copy)]
 pub struct Whistle;
@@ -131,12 +153,8 @@ impl Whistle {
         );
         let weights = read()?;
         let api = Api::open()?;
-        if let Some(threads) = std::env::var("JIMMY_WHISTLE_THREADS")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-        {
-            unsafe { (api.set_threads)(threads) };
-        }
+        let threads = configured_threads();
+        unsafe { (api.set_threads)(threads) };
         // The backing bytes live as long as the loaded process-wide runtime.
         let status = unsafe { (api.load)(weights.as_ptr(), weights.len() as u64) };
         if status < 0 {
@@ -146,7 +164,7 @@ impl Whistle {
             unsafe { (api.models)() } & 2 != 0,
             "Cactus artifact does not contain a speech model"
         );
-        unsafe { (api.set_threads)(1) };
+        unsafe { (api.set_threads)(threads) };
         let _ = MODEL_STATE.set(Runtime {
             api,
             _weights: weights,
@@ -154,7 +172,12 @@ impl Whistle {
         Ok(Self)
     }
 
-    fn recognize(&self, audio: &[i16], options: &Recognition) -> Result<Transcript> {
+    fn recognize(
+        &self,
+        scratch: &mut Scratch,
+        audio: &[i16],
+        options: &Recognition,
+    ) -> Result<Transcript> {
         if audio.is_empty() {
             return Ok(Transcript::default());
         }
@@ -166,28 +189,33 @@ impl Whistle {
         let keywords = (!options.keywords.is_empty())
             .then(|| CString::new(options.keywords.join("\n")))
             .transpose()?;
-        let audio: Vec<f32> = audio
-            .iter()
-            .map(|&sample| f32::from(sample) / 32768.0)
-            .collect();
-        let mut out = vec![0u8; 256 * 1024];
+        scratch.audio.clear();
+        scratch
+            .audio
+            .extend(audio.iter().map(|&sample| f32::from(sample) / 32768.0));
+        if scratch.out.len() < 256 * 1024 {
+            scratch.out.resize(256 * 1024, 0);
+        } else {
+            scratch.out[0] = 0;
+        }
         let runtime = MODEL_STATE.get().context("Whistle has not been loaded")?;
         // Audio, strings and output remain valid for the call. Counts are bounded above.
         let status = unsafe {
             (runtime.api.transcribe)(
-                audio.as_ptr(),
-                audio.len() as i32,
+                scratch.audio.as_ptr(),
+                scratch.audio.len() as i32,
                 language.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 keywords.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 1,
-                out.as_mut_ptr().cast(),
-                out.len() as i32,
+                scratch.out.as_mut_ptr().cast(),
+                scratch.out.len() as i32,
             )
         };
         if status < 0 {
             bail!("{}", runtime.api.error());
         }
-        let json = CStr::from_bytes_until_nul(&out).context("unterminated Whistle response")?;
+        let json =
+            CStr::from_bytes_until_nul(&scratch.out).context("unterminated Whistle response")?;
         serde_json::from_slice(json.to_bytes()).context("decode Whistle response")
     }
 }
@@ -197,8 +225,9 @@ impl Stt for Whistle {
         REQUIRED.fetch_add(1, Ordering::AcqRel);
         let guard = RUNTIME.lock();
         REQUIRED.fetch_sub(1, Ordering::AcqRel);
-        let _guard = guard.map_err(|_| "Whistle lock poisoned".to_owned())?;
-        self.recognize(audio, options).map_err(|e| format!("{e:#}"))
+        let mut guard = guard.map_err(|_| "Whistle lock poisoned".to_owned())?;
+        self.recognize(&mut guard, audio, options)
+            .map_err(|e| format!("{e:#}"))
     }
 
     fn try_partial(
@@ -209,12 +238,12 @@ impl Stt for Whistle {
         if REQUIRED.load(Ordering::Acquire) > 0 {
             return Ok(None);
         }
-        let _guard = match RUNTIME.try_lock() {
+        let mut guard = match RUNTIME.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Poisoned(_)) => return Err("Whistle lock poisoned".into()),
         };
-        self.recognize(audio, options)
+        self.recognize(&mut guard, audio, options)
             .map(Some)
             .map_err(|e| format!("{e:#}"))
     }

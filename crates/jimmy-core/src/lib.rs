@@ -1,9 +1,11 @@
 //! Synchronous voice turn state machine, shared by native and browser hosts.
 mod resample;
 mod text;
+mod vad;
 
 pub use resample::Resampler;
 pub use text::speech_text;
+pub use vad::{EnergyVad, filter_hallucination};
 
 use jimmy_proto::{
     ClientEvent, Codec, Configure, EndReason, INPUT_RATE, Mode, OUTPUT_RATE, PROTOCOL, ServerEvent,
@@ -71,39 +73,6 @@ pub trait Vad {
     fn speech(&mut self, frame: &[i16]) -> bool;
 }
 
-#[derive(Default)]
-pub struct EnergyVad {
-    noise: f32,
-    onset: u8,
-    hangover: u8,
-}
-
-impl Vad for EnergyVad {
-    fn speech(&mut self, frame: &[i16]) -> bool {
-        if frame.is_empty() {
-            return false;
-        }
-        let (sum, energy) = frame.iter().fold((0.0, 0.0), |(sum, energy), &sample| {
-            let sample = f32::from(sample);
-            (sum + sample, energy + sample * sample)
-        });
-        let mean = sum / frame.len() as f32;
-        let rms = (energy / frame.len() as f32 - mean * mean).max(0.0).sqrt();
-        let voiced = rms > (self.noise * 3.5).max(100.0);
-        if voiced {
-            self.onset = (self.onset + 1).min(2);
-            if self.onset >= 2 {
-                self.hangover = 3;
-            }
-        } else {
-            self.noise = (self.noise * 0.98 + rms * 0.02).min(350.0);
-            self.onset = 0;
-            self.hangover = self.hangover.saturating_sub(1);
-        }
-        self.hangover != 0
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub mode: Mode,
@@ -153,6 +122,13 @@ struct Utterance {
     awaiting_command: Option<usize>,
     waited: bool,
     agreement: Agreement,
+    rms_sum: f64,
+    rms_frames: usize,
+    /// Smoothed peak RMS of active speech in this utterance.
+    peak_rms: f32,
+    /// Peak active RMS of the foreground speaker once a wake phrase matched, used
+    /// so a much quieter background talker cannot hold the turn open past the command.
+    fg_level: Option<f32>,
 }
 
 impl Utterance {
@@ -167,7 +143,22 @@ impl Utterance {
             awaiting_command: None,
             waited: false,
             agreement: Agreement::default(),
+            rms_sum: 0.0,
+            rms_frames: 0,
+            peak_rms: 0.0,
+            fg_level: None,
         }
+    }
+
+    fn active_rms(&self) -> f32 {
+        if self.rms_frames == 0 {
+            return 50.0;
+        }
+        ((self.rms_sum / self.rms_frames as f64) as f32).max(50.0)
+    }
+
+    fn is_foreground(&self, rms: f32) -> bool {
+        self.fg_level.is_none_or(|fg| rms >= fg * 0.18)
     }
 
     fn command_words(&self, transcript: &Transcript) -> Vec<Word> {
@@ -241,6 +232,14 @@ enum SpeakItem {
     Cue(String),
 }
 
+struct WaitSilence {
+    silence: usize,
+    /// Typical active RMS of the background speech that triggered suppression.
+    level: f32,
+    /// Consecutive voiced frames substantially louder than `level`.
+    surge: u8,
+}
+
 pub struct Session<S, T, V = EnergyVad> {
     stt: S,
     tts: T,
@@ -251,13 +250,16 @@ pub struct Session<S, T, V = EnergyVad> {
     frame: Vec<i16>,
     pre_roll: VecDeque<i16>,
     utterance: Option<Utterance>,
-    wait_silence: Option<usize>,
+    wait_silence: Option<WaitSilence>,
     ptt: bool,
     turn: Turn,
     open: bool,
     reserved_turn: bool,
     playback_revision: u32,
     followup: usize,
+    /// Smoothed peak RMS of the user who woke Jimmy, used to keep a quieter
+    /// distant TV or background talker from hijacking the follow-up window.
+    speaker_level: Option<f32>,
     next_wake_reply: usize,
     chunker: Chunker,
     queued_text: usize,
@@ -305,6 +307,7 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             reserved_turn: false,
             playback_revision: 0,
             followup: 0,
+            speaker_level: None,
             next_wake_reply: 0,
             chunker: Chunker::default(),
             queued_text: 0,
@@ -574,22 +577,66 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
         let followup = self.followup > 0;
         self.followup = self.followup.saturating_sub(FRAME);
         if let Some(wait) = &mut self.wait_silence {
-            *wait = if voiced { 0 } else { *wait + FRAME };
-            if *wait >= samples(500) {
-                self.wait_silence = None;
+            let mut breakout = false;
+            if voiced {
+                wait.silence = 0;
+                let rms = frame_rms(frame);
+                if rms > wait.level * 3.2 {
+                    wait.surge = wait.surge.saturating_add(1);
+                    if wait.surge >= 3 {
+                        breakout = true;
+                    }
+                } else {
+                    wait.surge = 0;
+                    wait.level = (wait.level * 0.96 + rms * 0.04).max(50.0);
+                }
+            } else {
+                wait.silence += FRAME;
+                wait.surge = 0;
             }
-            return;
+            if breakout {
+                self.wait_silence = None;
+            } else {
+                if self.pre_roll.len() == PRE_ROLL {
+                    self.pre_roll.drain(..FRAME);
+                }
+                self.pre_roll.extend(frame);
+                if wait.silence >= samples(500) {
+                    self.wait_silence = None;
+                }
+                return;
+            }
         }
         if self.utterance.is_none() {
             let listening = self.ptt || self.settings.mode != Mode::Ptt;
             let speaker = self.speaking && !self.settings.echo_cancelled;
+            let is_followup =
+                !self.ptt && self.settings.mode == Mode::Wake && followup && !speaker;
             let wake_required =
                 !self.ptt && ((self.settings.mode == Mode::Wake && !followup) || speaker);
-            if listening && voiced {
+            // During a wake-mode follow-up window, ignore audio far quieter than the
+            // person who woke Jimmy (e.g. a TV in another room) so it cannot hijack
+            // the open window and trigger a feedback loop.
+            let followup_allowed = !is_followup
+                || self
+                    .speaker_level
+                    .is_none_or(|level| frame_rms(frame) >= level * 0.25);
+            if listening && voiced && followup_allowed {
                 if !wake_required && self.speaking {
                     self.cancel();
                 }
+                if is_followup {
+                    // Consume the follow-up window so one reply grants at most one
+                    // follow-up turn without repeating the wake phrase.
+                    self.followup = 0;
+                }
                 self.start_speech(wake_required);
+                if is_followup
+                    && let Some(level) = self.speaker_level
+                    && let Some(utterance) = &mut self.utterance
+                {
+                    utterance.fg_level = Some(level * 0.85);
+                }
             } else {
                 if listening {
                     if self.pre_roll.len() == PRE_ROLL {
@@ -601,8 +648,10 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             }
         }
         let utterance = self.utterance.as_mut().expect("speech onset");
+        let rms = frame_rms(frame);
+        let active_speech = voiced && utterance.is_foreground(rms);
         if let Some(silence) = &mut utterance.awaiting_command {
-            if !voiced {
+            if !active_speech {
                 *silence += FRAME;
                 if *silence < samples(COMMAND_WAIT_MS) {
                     if self.pre_roll.len() == PRE_ROLL {
@@ -622,7 +671,20 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
         }
         utterance.audio.extend_from_slice(frame);
         utterance.elapsed += FRAME;
-        utterance.silence = if voiced { 0 } else { utterance.silence + FRAME };
+        if active_speech {
+            utterance.silence = 0;
+            utterance.rms_sum += f64::from(rms);
+            utterance.rms_frames += 1;
+            if rms > utterance.peak_rms {
+                utterance.peak_rms = 0.5 * utterance.peak_rms + 0.5 * rms;
+            }
+            if let Some(fg) = &mut utterance.fg_level {
+                let target = if rms > *fg { rms } else { *fg };
+                *fg = (*fg * 0.94 + target * 0.06).max(250.0);
+            }
+        } else {
+            utterance.silence += FRAME;
+        }
         let endpoint = !self.ptt && utterance.silence >= samples(self.settings.endpoint_ms);
         let rollover = utterance.audio.len() >= MAX_UTTERANCE;
         if utterance.wake_required {
@@ -678,6 +740,10 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             // Keep the phrase as recognition context. Decoding its clipped tail
             // in isolation can turn the last syllable into spurious command words.
             utterance.wake_match = Some((self.settings.wake.clone(), matched.end));
+            if utterance.peak_rms >= 250.0 {
+                utterance.fg_level = Some(utterance.peak_rms);
+                self.speaker_level = Some(utterance.peak_rms);
+            }
             utterance.next_pass = utterance.elapsed + samples(self.settings.partial_ms);
             self.utterance = Some(utterance);
             return;
@@ -686,7 +752,11 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             self.error("stt", error);
         }
         if endpoint || utterance.elapsed >= samples(2_400) {
-            self.wait_silence = (utterance.silence < samples(500)).then_some(utterance.silence);
+            self.wait_silence = (utterance.silence < samples(500)).then_some(WaitSilence {
+                silence: utterance.silence,
+                level: utterance.active_rms(),
+                surge: 0,
+            });
         } else {
             utterance.next_pass = utterance.elapsed + samples(400);
             self.utterance = Some(utterance);
@@ -695,15 +765,19 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
 
     fn partial(&mut self) {
         let utterance = self.utterance.as_mut().expect("active speech");
-        utterance.next_pass += samples(self.settings.partial_ms);
+        // Keep short turns responsive at `partial_ms`, but back off as the buffer
+        // grows so full-buffer re-transcription stays ahead of real time.
+        let duration_ms = (utterance.audio.len() / (INPUT_RATE as usize / 1000)) as u32;
+        let step_ms = self.settings.partial_ms.max(duration_ms / 3);
+        utterance.next_pass = utterance.elapsed + samples(step_ms);
         match self
             .stt
             .try_partial(&utterance.audio, &self.settings.recognition)
         {
-            Ok(Some(transcript)) => {
+            Ok(Some(mut transcript)) => {
+                filter_hallucination(&utterance.audio, &mut transcript);
                 let words = utterance.command_words(&transcript);
                 if words.is_empty()
-                    && utterance.wake_match.is_some()
                     && utterance.agreement.previous.is_empty()
                     && utterance.agreement.committed.is_empty()
                 {
@@ -739,6 +813,7 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             .stt
             .transcribe(&utterance.audio[..kept], &self.settings.recognition)
             .map(|mut transcript| {
+                filter_hallucination(&utterance.audio[..kept], &mut transcript);
                 let words = utterance.command_words(&transcript);
                 transcript.words = std::mem::take(&mut utterance.agreement).finish(words);
                 transcript
@@ -779,6 +854,12 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
             }
             Ok(mut transcript) => {
                 transcript.text = words_text(&transcript.words);
+                if !transcript.words.is_empty() && utterance.peak_rms >= 250.0 {
+                    self.speaker_level = Some(match self.speaker_level {
+                        Some(prev) => prev * 0.5 + utterance.peak_rms * 0.5,
+                        None => utterance.peak_rms,
+                    });
+                }
                 self.events.push_back(ServerEvent::Final {
                     turn: self.turn,
                     transcript,
@@ -894,6 +975,18 @@ impl<S: Stt, T: Tts, V: Vad> Session<S, T, V> {
 
 fn samples(ms: u32) -> usize {
     ms as usize * (INPUT_RATE as usize / 1000)
+}
+
+fn frame_rms(frame: &[i16]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let (sum, energy) = frame.iter().fold((0.0f32, 0.0f32), |(sum, energy), &s| {
+        let s = f32::from(s);
+        (sum + s, energy + s * s)
+    });
+    let mean = sum / frame.len() as f32;
+    (energy / frame.len() as f32 - mean * mean).max(0.0).sqrt()
 }
 
 fn words_text(words: &[Word]) -> String {

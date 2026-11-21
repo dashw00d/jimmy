@@ -116,7 +116,9 @@ export class Jimmy {
     if (event.type === 'session.configure' && event.output_codec === 'opus') {
       throw new Error('Jimmy web playback expects PCM16');
     }
-    if (event.type === 'cancel' && (event.turn == null || event.turn === this.#speaking)) this.#dropAudio();
+    if ((event.type === 'cancel' || event.type === 'speak.stop') && (event.turn == null || event.turn === this.#speaking)) {
+      this.#dropAudio();
+    }
     if (!this.#warm) {
       if (this.#controls.length >= 32) throw new Error('Jimmy is still warming and its queue is full');
       this.#controls.push(event);
@@ -131,6 +133,7 @@ export class Jimmy {
   listenStop(): void { this.send({ type: 'listen.stop' }); }
   speakAppend(text: string, turn: Turn | null = null): void { this.send({ type: 'speak.append', text, turn }); }
   speakFlush(turn: Turn | null = null): void { this.send({ type: 'speak.flush', turn }); }
+  speakStop(turn: Turn | null = null): void { this.send({ type: 'speak.stop', turn }); }
   playCue(id: string, turn: Turn | null = null): void { this.send({ type: 'cue.play', id, turn }); }
   cancel(turn: Turn | null = null): void { this.send({ type: 'cancel', turn }); }
 
@@ -212,7 +215,7 @@ export class Jimmy {
 
   async #closeAudio(): Promise<void> {
     clearInterval(this.#timer);
-    this.#worker?.postMessage({ ring: null });
+    this.#worker?.postMessage({ ring: null, resetAck: true });
     this.#worklet?.disconnect();
     this.#worklet?.port.close();
     for (const track of this.#mic?.getTracks() ?? []) track.stop();

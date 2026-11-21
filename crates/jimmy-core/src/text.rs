@@ -36,7 +36,7 @@ pub(crate) struct Chunker {
     text: String,
     fenced: bool,
     ticks: u8,
-    first: bool,
+    emitted_first: bool,
     link: bool,
 }
 
@@ -62,7 +62,7 @@ impl Chunker {
     }
 
     pub fn take(&mut self, flush: bool) -> Option<String> {
-        let limit = if self.first { 240 } else { 100 };
+        let limit = if self.emitted_first { 240 } else { 100 };
         let mut cut = None;
         let mut whitespace = None;
         let mut in_link = self.link;
@@ -77,8 +77,8 @@ impl Chunker {
             if !in_link && ch.is_whitespace() {
                 whitespace = Some(at);
                 if matches!(previous, '.' | '!' | '?' | '\n')
-                    || (matches!(previous, ',' | ':' | ';') && at >= 24 && !self.first)
-                    || (previous == ',' && at >= 16 && !self.first)
+                    || (matches!(previous, ',' | ':' | ';') && at >= 24 && !self.emitted_first)
+                    || (previous == ',' && at >= 16 && !self.emitted_first)
                     || at >= limit
                 {
                     cut = Some(at);
@@ -100,7 +100,7 @@ impl Chunker {
         let chunk = spoken(&self.text[..end]);
         self.link = in_link;
         self.text.drain(..end);
-        self.first |= !chunk.is_empty();
+        self.emitted_first |= !chunk.is_empty();
         Some(chunk)
     }
 

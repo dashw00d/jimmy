@@ -45,8 +45,9 @@ self.onmessage = async ({ data }) => {
       clearInterval(timer);
       session?.free();
       self.close();
-    } else if (data.ring !== undefined) {
-      capture = data.ring ? new Ring(data.ring) : undefined;
+    } else if (data.ring !== undefined || data.resetAck) {
+      if (data.ring !== undefined) capture = data.ring ? new Ring(data.ring) : undefined;
+      if (data.resetAck) playbackAhead = 0;
     } else if (data.ack) {
       playbackAhead = Math.max(0, playbackAhead - 1);
     } else if (session) {

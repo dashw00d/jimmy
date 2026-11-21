@@ -189,9 +189,10 @@ pub fn transcribe(stt: &mut impl Stt, pcm: &[i16], options: &Recognition) -> Res
                 end = earliest + (index + 1) * frame;
             }
         }
-        let part = stt
+        let mut part = stt
             .transcribe(&left[..end], options)
             .map_err(anyhow::Error::msg)?;
+        jimmy_core::filter_hallucination(&left[..end], &mut part);
         if !part.text.is_empty() {
             if !result.text.is_empty() {
                 result.text.push(' ');

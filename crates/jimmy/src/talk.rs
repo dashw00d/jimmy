@@ -4,9 +4,9 @@ use anyhow::{Context, Result, bail};
 use jimmy_proto::{ClientEvent, Mode, ServerEvent, Turn};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     env,
-    io::{BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -30,6 +30,16 @@ const OLLAMA_URL: &str = "http://localhost:11434/v1";
 
 #[derive(Debug)]
 pub enum Backend {
+    Codex {
+        program: PathBuf,
+        model: String,
+        cwd: PathBuf,
+    },
+    Claude {
+        program: PathBuf,
+        model: String,
+        cwd: PathBuf,
+    },
     Command {
         program: PathBuf,
         args: Vec<String>,
@@ -116,36 +126,14 @@ fn detect(model: Option<&str>) -> Result<Agent> {
 fn codex(model: Option<&str>) -> Result<Agent> {
     let program = find_program("codex")
         .context("The Codex CLI is not on PATH. Install it, then run `codex login`.")?;
-    let model = model.unwrap_or(CODEX_MODEL);
-    let mut args: Vec<String> = [
-        "exec",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--sandbox",
-        "read-only",
-        "--model",
-        model,
-        "-c",
-        "model_reasoning_effort=\"medium\"",
-        "-c",
-        "mcp_servers={}",
-        "-c",
-        "web_search=\"disabled\"",
-    ]
-    .map(String::from)
-    .into();
-    for feature in ["memories", "hooks", "plugins", "shell_tool", "unified_exec"] {
-        args.extend(["--disable".into(), feature.into()]);
-    }
-    args.push("-".into());
+    let model = model.unwrap_or(CODEX_MODEL).to_owned();
     Ok(Agent {
         name: "Codex".into(),
         detail: format!("Codex CLI, {model}"),
-        backend: Backend::Command {
+        backend: Backend::Codex {
             program,
-            args,
-            cwd: Some(env::temp_dir()),
-            instructions: true,
+            model,
+            cwd: env::temp_dir(),
         },
     })
 }
@@ -154,30 +142,14 @@ fn claude(model: Option<&str>) -> Result<Agent> {
     let program = find_program("claude").context(
         "The Claude Code CLI is not on PATH. Install it, then run `claude` once to sign in.",
     )?;
-    let model = model.unwrap_or(CLAUDE_MODEL);
-    let args = [
-        "--print",
-        "--model",
-        model,
-        "--tools",
-        "",
-        "--no-session-persistence",
-        "--strict-mcp-config",
-        "--setting-sources",
-        "",
-        "--system-prompt",
-        INSTRUCTIONS,
-    ]
-    .map(String::from)
-    .into();
+    let model = model.unwrap_or(CLAUDE_MODEL).to_owned();
     Ok(Agent {
         name: "Claude".into(),
         detail: format!("Claude Code CLI, {model}"),
-        backend: Backend::Command {
+        backend: Backend::Claude {
             program,
-            args,
-            cwd: Some(env::temp_dir()),
-            instructions: false,
+            model,
+            cwd: env::temp_dir(),
         },
     })
 }
@@ -366,7 +338,7 @@ impl Cancel {
 
     fn cancel(&self) {
         self.0.0.store(true, Ordering::Relaxed);
-        if let Some(child) = self.0.1.lock().unwrap().as_mut() {
+        if let Some(child) = self.0.1.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             kill(child);
         }
     }
@@ -428,6 +400,375 @@ impl Clean {
     }
 }
 
+fn spawn_managed(mut command: Command, cancel: &Cancel) -> Result<(std::process::ChildStdin, std::process::ChildStdout, thread::JoinHandle<String>)> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    *cancel.0.1.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+    if cancel.cancelled() {
+        cancel.cancel();
+    }
+    let errors = thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = (&mut stderr).take(1_000_000).read_to_end(&mut text);
+        String::from_utf8_lossy(&text).into_owned()
+    });
+    Ok((stdin, stdout, errors))
+}
+
+fn finish_managed(cancel: &Cancel, errors: thread::JoinHandle<String>, kill_child: bool) -> Result<(std::process::ExitStatus, String)> {
+    let Some(mut child) = cancel.0.1.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        bail!("command process handle missing");
+    };
+    if kill_child {
+        kill(&mut child);
+    }
+    let status = child.wait()?;
+    let errors = errors.join().unwrap_or_default();
+    Ok((status, errors))
+}
+
+fn last_error_line(errors: &str) -> &str {
+    errors
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output")
+}
+
+/// Streams token deltas from `codex app-server --stdio` via JSON-RPC.
+fn run_codex(
+    program: &PathBuf,
+    model: &str,
+    cwd: &PathBuf,
+    prompt_text: String,
+    cancel: &Cancel,
+    on_text: &mut dyn FnMut(String),
+) -> Result<String> {
+    let mut command = Command::new(program);
+    command
+        .args([
+            "app-server",
+            "--stdio",
+            "--disable",
+            "memories",
+            "--disable",
+            "shell_tool",
+            "--disable",
+            "unified_exec",
+            "--disable",
+            "hooks",
+            "--disable",
+            "plugins",
+            "-c",
+            "mcp_servers={}",
+            "-c",
+            "web_search=\"disabled\"",
+        ])
+        .current_dir(cwd);
+    let (mut stdin, stdout, errors) = spawn_managed(command, cancel)
+        .with_context(|| format!("Start {}", program.display()))?;
+    let mut reader = BufReader::new(stdout);
+    let mut notifications = VecDeque::new();
+
+    let send = |stdin: &mut std::process::ChildStdin, msg: &Value| -> Result<()> {
+        serde_json::to_writer(&mut *stdin, msg)?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        Ok(())
+    };
+    let read_event = |reader: &mut BufReader<std::process::ChildStdout>| -> Result<Value> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let count = reader.read_line(&mut line)?;
+            if count == 0 {
+                bail!("Codex app-server closed the stream");
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return serde_json::from_str(trimmed).context("Parse Codex app-server event");
+        }
+    };
+    let decline = |stdin: &mut std::process::ChildStdin, event: &Value| -> Result<()> {
+        send(
+            stdin,
+            &json!({
+                "id": event["id"],
+                "error": {
+                    "code": -32601,
+                    "message": "Jimmy conversation does not grant tool requests",
+                }
+            }),
+        )
+    };
+    let request = |stdin: &mut std::process::ChildStdin,
+                   reader: &mut BufReader<std::process::ChildStdout>,
+                   notifications: &mut VecDeque<Value>,
+                   id: u64,
+                   method: &str,
+                   params: Value|
+     -> Result<Value> {
+        send(stdin, &json!({"id": id, "method": method, "params": params}))?;
+        loop {
+            if cancel.cancelled() {
+                bail!("cancelled");
+            }
+            let event = read_event(reader)?;
+            if event.get("method").is_some() && event.get("id").is_some() {
+                decline(stdin, &event)?;
+            } else if event.get("id").and_then(Value::as_u64) == Some(id) {
+                if let Some(err) = event.get("error") {
+                    let msg = err["message"].as_str().unwrap_or("Codex RPC error");
+                    bail!("{msg}");
+                }
+                return Ok(event["result"].clone());
+            } else if event.get("method").is_some() {
+                notifications.push_back(event);
+            }
+        }
+    };
+
+    let outcome: Result<String> = (|| {
+        request(
+            &mut stdin,
+            &mut reader,
+            &mut notifications,
+            1,
+            "initialize",
+            json!({"clientInfo": {"name": "jimmy", "version": env!("CARGO_PKG_VERSION")}}),
+        )?;
+        send(&mut stdin, &json!({"method": "initialized"}))?;
+        let started = request(
+            &mut stdin,
+            &mut reader,
+            &mut notifications,
+            2,
+            "thread/start",
+            json!({
+                "cwd": cwd.to_string_lossy(),
+                "ephemeral": true,
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "developerInstructions": INSTRUCTIONS,
+                "model": model,
+            }),
+        )?;
+        let thread_id = started["thread"]["id"]
+            .as_str()
+            .context("Codex thread/start missing thread id")?
+            .to_owned();
+        let turn_res = request(
+            &mut stdin,
+            &mut reader,
+            &mut notifications,
+            3,
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "effort": "medium",
+                "input": [{"type": "text", "text": prompt_text}],
+            }),
+        )?;
+        let turn_id = turn_res["turn"]["id"]
+            .as_str()
+            .context("Codex turn/start missing turn id")?
+            .to_owned();
+
+        let mut commentary = HashSet::<String>::new();
+        let mut streamed = HashSet::<String>::new();
+        let mut reply = String::new();
+        loop {
+            if cancel.cancelled() {
+                bail!("cancelled");
+            }
+            let event = match notifications.pop_front() {
+                Some(ev) => ev,
+                None => read_event(&mut reader)?,
+            };
+            let Some(method) = event.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            if event.get("id").is_some() {
+                decline(&mut stdin, &event)?;
+                continue;
+            }
+            let params = &event["params"];
+            if params.get("threadId").and_then(Value::as_str) != Some(thread_id.as_str()) {
+                continue;
+            }
+            if method == "turn/completed"
+                && params["turn"]["id"].as_str() == Some(turn_id.as_str())
+            {
+                let status = params["turn"]["status"].as_str().unwrap_or("unknown");
+                if status != "completed" {
+                    let msg = params["turn"]["error"]["message"]
+                        .as_str()
+                        .unwrap_or(status);
+                    bail!("{msg}");
+                }
+                break;
+            }
+            if params.get("turnId").and_then(Value::as_str) != Some(turn_id.as_str()) {
+                continue;
+            }
+            let mut delta: Option<String> = None;
+            if matches!(method, "item/started" | "item/completed") {
+                let item = &params["item"];
+                if item["type"].as_str() == Some("agentMessage")
+                    && let Some(item_id) = item["id"].as_str()
+                {
+                    if item["phase"].as_str() == Some("commentary") {
+                        commentary.insert(item_id.to_owned());
+                    } else if method == "item/completed"
+                        && !streamed.contains(item_id)
+                        && let Some(text) = item["text"].as_str()
+                    {
+                        delta = Some(text.to_owned());
+                    }
+                }
+            } else if method == "item/agentMessage/delta"
+                && let Some(item_id) = params["itemId"].as_str()
+                && !commentary.contains(item_id)
+                && let Some(text) = params["delta"].as_str()
+            {
+                streamed.insert(item_id.to_owned());
+                delta = Some(text.to_owned());
+            }
+            if let Some(text) = delta
+                && !text.is_empty()
+                && !cancel.cancelled()
+            {
+                reply.push_str(&text);
+                on_text(text);
+            }
+        }
+        Ok(reply)
+    })();
+
+    drop(stdin);
+    let (_, err_text) = finish_managed(cancel, errors, true)?;
+    if cancel.cancelled() {
+        bail!("cancelled");
+    }
+    outcome.map_err(|err| {
+        let detail = last_error_line(&err_text);
+        if detail != "no output" {
+            anyhow::anyhow!("{err} ({detail})")
+        } else {
+            err
+        }
+    })
+}
+
+/// Streams token deltas from `claude --print --output-format stream-json`.
+fn run_claude(
+    program: &PathBuf,
+    model: &str,
+    cwd: &PathBuf,
+    prompt_text: String,
+    cancel: &Cancel,
+    on_text: &mut dyn FnMut(String),
+) -> Result<String> {
+    let mut command = Command::new(program);
+    command
+        .args([
+            "--print",
+            "--model",
+            model,
+            "--tools",
+            "",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "",
+            "--system-prompt",
+            INSTRUCTIONS,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ])
+        .current_dir(cwd);
+    let (mut stdin, stdout, errors) = spawn_managed(command, cancel)
+        .with_context(|| format!("Start {}", program.display()))?;
+    thread::spawn(move || {
+        let _ = stdin.write_all(prompt_text.as_bytes());
+    });
+    let mut reader = BufReader::new(stdout);
+    let mut reply = String::new();
+    let mut saw_delta = false;
+    let mut stream_error: Option<String> = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if cancel.cancelled() {
+            break;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        match event["type"].as_str() {
+            Some("stream_event") => {
+                let inner = &event["event"];
+                if inner["type"].as_str() == Some("content_block_delta")
+                    && inner["delta"]["type"].as_str() == Some("text_delta")
+                    && let Some(text) = inner["delta"]["text"].as_str()
+                    && !text.is_empty()
+                {
+                    saw_delta = true;
+                    reply.push_str(text);
+                    on_text(text.to_owned());
+                }
+            }
+            Some("result") => {
+                if event["is_error"].as_bool() == Some(true) {
+                    stream_error = event["result"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| Some("Claude returned an error".into()));
+                } else if !saw_delta
+                    && let Some(text) = event["result"].as_str()
+                    && !text.is_empty()
+                {
+                    reply.push_str(text);
+                    on_text(text.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    let (status, err_text) = finish_managed(cancel, errors, false)?;
+    if cancel.cancelled() {
+        bail!("cancelled");
+    }
+    if let Some(msg) = stream_error {
+        bail!("{msg}");
+    }
+    if !status.success() && reply.trim().is_empty() {
+        bail!(
+            "{} exited with {status}: {}",
+            program.display(),
+            last_error_line(&err_text)
+        );
+    }
+    Ok(reply)
+}
+
 fn run_command(
     backend: &Backend,
     input: String,
@@ -444,32 +785,14 @@ fn run_command(
     let mut command = Command::new(program);
     command
         .args(args)
-        .envs(env.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .envs(env.iter().map(|(key, value)| (key, value)));
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = command
-        .spawn()
+    let (mut stdin, mut stdout, errors) = spawn_managed(command, cancel)
         .with_context(|| format!("Start {}", program.display()))?;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    *cancel.0.1.lock().unwrap() = Some(child);
-    if cancel.cancelled() {
-        cancel.cancel();
-    }
     thread::spawn(move || {
         let _ = stdin.write_all(input.as_bytes());
-    });
-    let errors = thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = (&mut stderr).take(1_000_000).read_to_end(&mut text);
-        String::from_utf8_lossy(&text).into_owned()
     });
     let mut clean = Clean::default();
     let mut reply = String::new();
@@ -485,20 +808,16 @@ fn run_command(
             on_text(text);
         }
     }
-    let child = cancel.0.1.lock().unwrap().take();
-    let status = child.unwrap().wait()?;
-    let errors = errors.join().unwrap_or_default();
+    let (status, errors) = finish_managed(cancel, errors, false)?;
     if cancel.cancelled() {
         bail!("cancelled");
     }
     if !status.success() && reply.trim().is_empty() {
-        let detail = errors
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("no output");
-        bail!("{} exited with {status}: {detail}", program.display());
+        bail!(
+            "{} exited with {status}: {}",
+            program.display(),
+            last_error_line(&errors)
+        );
     }
     Ok(reply)
 }
@@ -608,6 +927,9 @@ struct Job {
 pub trait Report: Send + 'static {
     fn line(&mut self, text: &str);
     fn problem(&mut self, text: &str);
+    fn reply_start(&mut self, name: &str);
+    fn reply_chunk(&mut self, text: &str);
+    fn reply_end(&mut self);
 }
 
 pub struct Terminal;
@@ -619,6 +941,22 @@ impl Report for Terminal {
     fn problem(&mut self, text: &str) {
         eprintln!("jimmy: {text}");
     }
+    fn reply_start(&mut self, name: &str) {
+        print!("{name}: ");
+        let _ = io::stdout().flush();
+    }
+    fn reply_chunk(&mut self, text: &str) {
+        print!("{text}");
+        let _ = io::stdout().flush();
+    }
+    fn reply_end(&mut self) {
+        println!();
+    }
+}
+
+enum WorkerInput {
+    Prompt(String),
+    Messages(Value),
 }
 
 impl Agent {
@@ -638,8 +976,11 @@ impl Agent {
             let mut history = VecDeque::new();
             let mut job: Option<Job> = None;
             let mut next_id = 0;
-            let stop = |job: &mut Option<Job>| {
+            let stop = |job: &mut Option<Job>, report: &mut dyn Report| {
                 if let Some(job) = job.take() {
+                    if job.reading {
+                        report.reply_end();
+                    }
                     job.cancel.cancel();
                 }
             };
@@ -663,7 +1004,7 @@ impl Agent {
                     }
                     Ok(Message::Event(ServerEvent::SpeechStart { turn })) => {
                         if job.is_some() {
-                            stop(&mut job);
+                            stop(&mut job, &mut report);
                             send(ClientEvent::SpeakStop { turn: Some(turn) });
                         }
                     }
@@ -672,7 +1013,7 @@ impl Agent {
                         if text.is_empty() {
                             continue;
                         }
-                        stop(&mut job);
+                        stop(&mut job, &mut report);
                         report.line(&format!("You: {text}"));
                         next_id += 1;
                         let cancel = Cancel::default();
@@ -687,10 +1028,13 @@ impl Agent {
                             .collect::<Vec<_>>())
                             .to_string();
                         let input = match &*backend {
-                            Backend::Command { instructions, .. } => {
-                                Err(prompt(&history, &text, *instructions))
+                            Backend::Codex { .. } | Backend::Claude { .. } => {
+                                WorkerInput::Prompt(prompt(&history, &text, false))
                             }
-                            Backend::Http { .. } => Ok(messages(&history, &text)),
+                            Backend::Command { instructions, .. } => {
+                                WorkerInput::Prompt(prompt(&history, &text, *instructions))
+                            }
+                            Backend::Http { .. } => WorkerInput::Messages(messages(&history, &text)),
                         };
                         let latest = text.clone();
                         thread::spawn(move || {
@@ -698,19 +1042,54 @@ impl Agent {
                             let mut on_text = |text| {
                                 let _ = texts.send(Message::Text(id, text));
                             };
-                            let result = match input {
-                                Err(prompt) => run_command(
-                                    &backend,
-                                    prompt,
-                                    &[
-                                        ("JIMMY_TEXT", latest),
-                                        ("JIMMY_HISTORY", history_json),
-                                        ("JIMMY_TURN", turn.to_string()),
-                                    ],
+                            let result = match (&*backend, input) {
+                                (
+                                    Backend::Codex {
+                                        program,
+                                        model,
+                                        cwd,
+                                    },
+                                    WorkerInput::Prompt(prompt_text),
+                                ) => run_codex(
+                                    program,
+                                    model,
+                                    cwd,
+                                    prompt_text,
                                     &worker,
                                     &mut on_text,
                                 ),
-                                Ok(messages) => run_http(&backend, messages, &worker, &mut on_text),
+                                (
+                                    Backend::Claude {
+                                        program,
+                                        model,
+                                        cwd,
+                                    },
+                                    WorkerInput::Prompt(prompt_text),
+                                ) => run_claude(
+                                    program,
+                                    model,
+                                    cwd,
+                                    prompt_text,
+                                    &worker,
+                                    &mut on_text,
+                                ),
+                                (Backend::Command { .. }, WorkerInput::Prompt(prompt_text)) => {
+                                    run_command(
+                                        &backend,
+                                        prompt_text,
+                                        &[
+                                            ("JIMMY_TEXT", latest),
+                                            ("JIMMY_HISTORY", history_json),
+                                            ("JIMMY_TURN", turn.to_string()),
+                                        ],
+                                        &worker,
+                                        &mut on_text,
+                                    )
+                                }
+                                (Backend::Http { .. }, WorkerInput::Messages(messages)) => {
+                                    run_http(&backend, messages, &worker, &mut on_text)
+                                }
+                                _ => unreachable!(),
                             };
                             let _ =
                                 tx.send(Message::Done(id, result.map_err(|e| format!("{e:#}"))));
@@ -735,12 +1114,14 @@ impl Agent {
                                 continue;
                             }
                             current.reading = true;
+                            report.reply_start(&name);
                             if current.filler {
                                 send(ClientEvent::SpeakStop {
                                     turn: Some(current.turn),
                                 });
                             }
                         }
+                        report.reply_chunk(&text);
                         send(ClientEvent::SpeakAppend {
                             text,
                             turn: Some(current.turn),
@@ -750,9 +1131,14 @@ impl Agent {
                         let Some(done) = job.take_if(|job| job.id == id) else {
                             continue;
                         };
+                        if done.reading {
+                            report.reply_end();
+                        }
                         match result.map(|reply| reply.trim().to_owned()) {
                             Ok(reply) if !reply.is_empty() => {
-                                report.line(&format!("{name}: {reply}"));
+                                if !done.reading {
+                                    report.line(&format!("{name}: {reply}"));
+                                }
                                 history.push_back(Exchange {
                                     user: done.text,
                                     assistant: reply,
@@ -785,7 +1171,7 @@ impl Agent {
                         });
                     }
                     Ok(Message::Quit) | Err(RecvTimeoutError::Disconnected) => {
-                        stop(&mut job);
+                        stop(&mut job, &mut report);
                         return;
                     }
                     Err(RecvTimeoutError::Timeout) => {
@@ -798,7 +1184,7 @@ impl Agent {
                                 "{name} took longer than {}s",
                                 TIMEOUT.as_secs()
                             ));
-                            stop(&mut job);
+                            stop(&mut job, &mut report);
                             send(ClientEvent::SpeakStop { turn: Some(turn) });
                             send(ClientEvent::SpeakAppend {
                                 text: "Sorry, that took too long.".into(),
@@ -834,14 +1220,36 @@ mod tests {
     use jimmy_proto::Transcript;
 
     #[derive(Clone, Default)]
-    struct Log(Arc<Mutex<Vec<String>>>);
+    struct Log {
+        lines: Arc<Mutex<Vec<String>>>,
+        chunks: Arc<Mutex<Vec<String>>>,
+        current: Arc<Mutex<String>>,
+    }
 
     impl Report for Log {
         fn line(&mut self, text: &str) {
-            self.0.lock().unwrap().push(text.to_owned());
+            self.lines.lock().unwrap().push(text.to_owned());
         }
         fn problem(&mut self, text: &str) {
-            self.0.lock().unwrap().push(format!("problem: {text}"));
+            self.lines
+                .lock()
+                .unwrap()
+                .push(format!("problem: {text}"));
+        }
+        fn reply_start(&mut self, name: &str) {
+            let mut cur = self.current.lock().unwrap();
+            cur.clear();
+            cur.push_str(&format!("{name}: "));
+        }
+        fn reply_chunk(&mut self, text: &str) {
+            self.chunks.lock().unwrap().push(text.to_owned());
+            self.current.lock().unwrap().push_str(text);
+        }
+        fn reply_end(&mut self) {
+            let line = std::mem::take(&mut *self.current.lock().unwrap());
+            if !line.is_empty() {
+                self.lines.lock().unwrap().push(line);
+            }
         }
     }
 
@@ -911,7 +1319,7 @@ mod tests {
             ("Heard: what is my snack. Turns so far: 1".into(), 4)
         );
         drop(link);
-        let log = log.0.lock().unwrap();
+        let log = log.lines.lock().unwrap();
         assert_eq!(log[0], "You: my snack is grilled cheese");
         assert!(log[1].starts_with("Agent: Heard: my snack"), "{log:?}");
     }
@@ -936,7 +1344,7 @@ mod tests {
             ("Sorry, I couldn't get an answer from the agent.".into(), 1)
         );
         assert!(
-            log.0
+            log.lines
                 .lock()
                 .unwrap()
                 .iter()
@@ -1050,5 +1458,108 @@ mod tests {
         let text = prompt(&history, "what snack?", false);
         assert!(text.contains("User: my snack is cheese\nYou: Got it."));
         assert!(text.ends_with("The user just said: what snack?"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_app_server_streams_deltas_and_skips_commentary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-codex");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method")
+    if m == "initialize":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+    elif m == "thread/start":
+        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thr-1"}}}), flush=True)
+    elif m == "turn/start":
+        print(json.dumps({"id": msg["id"], "result": {"turn": {"id": "turn-1"}}}), flush=True)
+        # Emit commentary (must be ignored)
+        print(json.dumps({"method": "item/started", "params": {"threadId": "thr-1", "turnId": "turn-1", "item": {"id": "c1", "type": "agentMessage", "phase": "commentary"}}}), flush=True)
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"threadId": "thr-1", "turnId": "turn-1", "itemId": "c1", "delta": "thinking..."}}), flush=True)
+        # Emit streamed reply deltas
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"threadId": "thr-1", "turnId": "turn-1", "itemId": "m1", "delta": "Hello "}}), flush=True)
+        time.sleep(0.05)
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"threadId": "thr-1", "turnId": "turn-1", "itemId": "m1", "delta": "streamed world."}}), flush=True)
+        print(json.dumps({"method": "item/completed", "params": {"threadId": "thr-1", "turnId": "turn-1", "item": {"id": "m1", "type": "agentMessage", "text": "Hello streamed world."}}}), flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {"threadId": "thr-1", "turn": {"id": "turn-1", "status": "completed"}}}), flush=True)
+        break
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let agent = Agent {
+            name: "Codex".into(),
+            detail: "fake codex".into(),
+            backend: Backend::Codex {
+                program: script,
+                model: "test".into(),
+                cwd: dir.path().to_path_buf(),
+            },
+        };
+        let (link, rx, log) = talk(agent);
+        link.event(&final_event(1, "hi"));
+        let mut parts = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                ClientEvent::SpeakAppend { text, .. } => parts.push(text),
+                ClientEvent::SpeakFlush { .. } => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        drop(link);
+        assert_eq!(parts, vec!["Hello ", "streamed world."]);
+        assert_eq!(*log.chunks.lock().unwrap(), vec!["Hello ", "streamed world."]);
+        let lines = log.lines.lock().unwrap();
+        assert!(lines.iter().any(|l| l == "Codex: Hello streamed world."), "{lines:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_stream_json_streams_text_deltas() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-claude");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys
+_ = sys.stdin.read()
+print(json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "First "}}}), flush=True)
+print(json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "second."}}}), flush=True)
+print(json.dumps({"type": "result", "is_error": False, "result": "First second."}), flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let agent = Agent {
+            name: "Claude".into(),
+            detail: "fake claude".into(),
+            backend: Backend::Claude {
+                program: script,
+                model: "haiku".into(),
+                cwd: dir.path().to_path_buf(),
+            },
+        };
+        let (link, rx, log) = talk(agent);
+        link.event(&final_event(1, "hi"));
+        let mut parts = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                ClientEvent::SpeakAppend { text, .. } => parts.push(text),
+                ClientEvent::SpeakFlush { .. } => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        drop(link);
+        assert_eq!(parts, vec!["First ", "second."]);
+        assert_eq!(*log.chunks.lock().unwrap(), vec!["First ", "second."]);
     }
 }

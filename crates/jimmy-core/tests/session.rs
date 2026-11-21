@@ -776,3 +776,140 @@ fn pausing_after_each_wake_still_delivers_each_command() {
     assert_eq!(wakes, [1, 2], "events: {all:?}");
     assert_eq!(finals, [(1, COMMAND.to_owned()), (2, COMMAND.to_owned())]);
 }
+
+#[test]
+fn foreground_speech_breaks_through_background_talker_suppression() {
+    let stt = Recognizer {
+        replies: std::iter::repeat_n(Transcript::default(), 5)
+            .chain(std::iter::repeat_n(
+                transcript("Hey Jimmy open the list"),
+                6,
+            ))
+            .collect(),
+        ..Recognizer::default()
+    };
+    let mut session = Session::with_vad(stt, Synth::default(), Detector, Settings::default());
+    // 3 seconds of quiet background talker (~-40 dBFS alternating wave, RMS = 300).
+    let bg: Vec<i16> = (0..16_000 * 3)
+        .map(|i| if i % 2 == 0 { 300 } else { -300 })
+        .collect();
+    session.push_audio(&bg);
+    // Still in wait_silence; no wake yet.
+    assert!(
+        !events(&mut session)
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Wake { .. }))
+    );
+    // Foreground talker speaks 10x louder (+20 dB) with no silence gap before it.
+    let fg: Vec<i16> = (0..16_000 * 2)
+        .map(|i| if i % 2 == 0 { 3000 } else { -3000 })
+        .collect();
+    session.push_audio(&fg);
+    session.push_audio(&quiet(800));
+    let all = events(&mut session);
+    let (wakes, finals) = wakes_and_finals(&all);
+    assert_eq!(wakes, [1], "foreground speaker must break out of suppression");
+    assert_eq!(finals, [(1, "open the list".to_owned())]);
+}
+
+#[test]
+fn quieter_background_talker_cannot_prevent_foreground_endpointing() {
+    let stt = Recognizer {
+        replies: [
+            "Hey Jimmy",
+            "Hey Jimmy what time is it",
+            "Hey Jimmy what time is it",
+            "Hey Jimmy what time is it",
+        ]
+        .into_iter()
+        .map(transcript)
+        .collect(),
+        ..Recognizer::default()
+    };
+    let mut session = Session::with_vad(stt, Synth::default(), Detector, Settings::default());
+    // Loud foreground speaker (RMS = 3000) speaks wake + command (1.2 s).
+    let fg: Vec<i16> = (0..16_000 * 12 / 10)
+        .map(|i| if i % 2 == 0 { 3000 } else { -3000 })
+        .collect();
+    session.push_audio(&fg);
+    // Background talker keeps talking at -20 dB quieter (RMS = 300) for 1 s,
+    // which Detector still marks voiced, yet the turn must endpoint cleanly.
+    let bg: Vec<i16> = (0..16_000)
+        .map(|i| if i % 2 == 0 { 300 } else { -300 })
+        .collect();
+    session.push_audio(&bg);
+    let all = events(&mut session);
+    let (wakes, finals) = wakes_and_finals(&all);
+    assert_eq!(wakes, [1]);
+    assert_eq!(finals, [(1, "what time is it".to_owned())]);
+}
+
+#[test]
+fn followup_ignores_quieter_tv_and_consumes_window_after_one_turn() {
+    let stt = Recognizer {
+        replies: [
+            "Hey Jimmy",
+            "Hey Jimmy what is the weather",
+            "Hey Jimmy what is the weather",
+            "Hey Jimmy what is the weather",
+            "what about tomorrow",
+            "what about tomorrow",
+            "should not fire without wake",
+        ]
+        .into_iter()
+        .map(transcript)
+        .collect(),
+        ..Recognizer::default()
+    };
+    let mut session = Session::with_vad(stt, Synth::default(), Detector, Settings::default());
+    // 1. User wakes Jimmy loudly (RMS = 3000) and asks a question.
+    let fg: Vec<i16> = (0..16_000 * 12 / 10)
+        .map(|i| if i % 2 == 0 { 3000 } else { -3000 })
+        .collect();
+    session.push_audio(&fg);
+    session.push_audio(&quiet(800));
+    events(&mut session);
+
+    // 2. Jimmy speaks a reply and finishes -> 8 s follow-up window opens.
+    speak(&mut session, "It is sunny.", None);
+    for _ in 0..16 {
+        session.pull_audio(&mut [0; 480]);
+    }
+    assert!(!session.is_speaking());
+    events(&mut session);
+
+    // 3. A distant living-room TV (-20 dB quieter, RMS = 300) talks during follow-up:
+    //    must NOT hijack the follow-up window.
+    let tv: Vec<i16> = (0..16_000)
+        .map(|i| if i % 2 == 0 { 300 } else { -300 })
+        .collect();
+    session.push_audio(&tv);
+    session.push_audio(&quiet(800));
+    assert!(
+        events(&mut session).is_empty(),
+        "quieter distant TV must not trigger follow-up"
+    );
+
+    // 4. Now the foreground user speaks a follow-up: opens turn without wake and
+    //    consumes the follow-up window.
+    session.push_audio(&fg[..8_000]);
+    session.push_audio(&quiet(800));
+    let all = events(&mut session);
+    assert!(
+        all.iter()
+            .any(|e| matches!(e, ServerEvent::Final { transcript, .. } if transcript.text == "what about tomorrow")),
+        "foreground user follow-up must succeed: {all:?}"
+    );
+
+    // 5. Another burst right afterwards (before Jimmy speaks again) must NOT
+    //    cascade as a second free follow-up without saying the wake phrase.
+    session.push_audio(&fg[..8_000]);
+    session.push_audio(&quiet(800));
+    let cascade = events(&mut session);
+    assert!(
+        !cascade
+            .iter()
+            .any(|e| matches!(e, ServerEvent::SpeechStart { .. } | ServerEvent::Final { .. })),
+        "follow-up window must be consumed after one turn: {cascade:?}"
+    );
+}

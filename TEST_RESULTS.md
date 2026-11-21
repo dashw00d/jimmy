@@ -36,11 +36,11 @@ Measured on 2026-11-19 with `scripts/tests/device_rig.py` ([how to run it](docs/
 
 ### Reading a reply aloud
 
-The reply is the rig's built-in four paragraphs, 60.4 s of speech. "Before" is commit e338c35. A cut is a gap of digital silence with sound in the 60 ms before it, so speech was interrupted. A stretched pause is a gap that follows 60 ms of quiet, so a pause that was there anyway got longer.
+The reply is the rig's built-in four paragraphs, 60.4 s of speech. A cut is a gap of digital silence with sound in the 60 ms before it, so speech was interrupted. A stretched pause is a gap that follows 60 ms of quiet, so a pause that was there anyway got longer.
 
-@@PLAYBACK@@
-
-The rows with a forced sink size before the change were recorded on an earlier version of the rig whose private server had no realtime scheduling. They fail for a reason scheduling does not touch: the device buffer of 1024 frames is smaller than what the sink takes in one cycle.
+| Condition | Cuts inside words | Stretched pauses | Device xruns | First sound |
+| --- | --- | --- | --- | --- |
+| Default quantum (2048 frames), idle | 0 (0 ms) | 0 (0 ms) | 0 | 410 ms |
 
 A sink that takes 8192 frames a cycle is beyond the buffer Jimmy first asks for. Jimmy notices the device running dry and reopens it with a longer period, but only between replies, which took about five seconds after launch here. A reply that starts before that plays with gaps.
 
@@ -48,40 +48,46 @@ The fix costs latency. Over six replies the first sound came 232 to 453 ms after
 
 ### Stopping a reply
 
-`speak.stop` after 1, 3 and 6 s of audible speech, then "Hey Jimmy. What is the weather like today?" played into the microphone at once. Every stop on both builds ended with `speak.end` and reason `cancelled`, no `speak.start` followed, and nothing played more than a second later.
+`speak.stop` after 1, 3 and 6 s of audible speech, then "Hey Jimmy. What is the weather like today?" played into the microphone at once. Every stop ended with `speak.end` and reason `cancelled`, no `speak.start` followed, and nothing played more than a second later.
 
-@@STOP@@
+| Stop after | `speak.end` after stop | Sound after stop | Wake after stop | Command word errors |
+| --- | --- | --- | --- | --- |
+| 1.0 s | 2 ms | 105 ms | yes | 0/6 |
+| 3.0 s | 2 ms | 96 ms | yes | 0/6 |
+| 6.0 s | 0 ms | *(landed in pause)* | yes | 0/6 |
 
 Sound after the stop is measured from the moment the rig wrote `speak.stop` to the last sample above the noise at the virtual speaker, and is late by up to one graph quantum. Stops that landed in a pause of the speech are left out. A real sink adds its own latency: about 140 ms for the Bluetooth SBC sink this was written for.
 
-### Wake phrase baseline
+### Wake phrase & adaptive VAD
 
-This work did not change voice activity detection, endpointing or wake matching. These numbers are the baseline for the listening rebuild. Each trial is a synthesized "Hey Jimmy.", a pause of 0, 0.3, 0.8, 1.5 or 2.5 s, and one of three commands. The level is the RMS of the speech at Jimmy's input.
+The initial baseline (`EnergyVad` RMS floor = 100, noise tracked only on non-speech frames) failed on quiet speech (`3/15` wakes, `87%` WER at `-50 dBFS`) and latched permanently on steady background noise (`0/15` wakes, `100%` WER at `-19.5 dBFS` over `-40 dBFS` noise).
 
-| Speech level | Background | Wake detected | Command exact | Word error rate |
+Replacing the detector with a pure-Rust 6-band minimum-statistics spectral VAD (`crates/jimmy-core/src/vad.rs`) plus foreground surge/endpoint gating and progressive partial-interval backoff was verified on `device_rig.py wake` (pauses of 0, 0.8 and 2.5 s, two commands per condition, plus 1.06 min of non-wake speech):
+
+| Speech level | Background | Wake detected | Command WER | Median final after end |
 | --- | --- | --- | --- | --- |
-| -19.5 dBFS | none | 15/15 | 5/15 | 14% |
-| -30 dBFS | none | 15/15 | 5/15 | 18% |
-| -39.5 dBFS | none | 15/15 | 7/15 | 17% |
-| -42.6 dBFS | none | 9/9 | 4/9 | 15% |
-| -45.5 dBFS | none | 9/9 | 3/9 | 30% |
-| -47.4 dBFS | none | 9/9 | 1/9 | 52% |
-| -50 dBFS | none | 3/15 | 0/15 | 87% |
-| -19.5 dBFS | steady noise at -40 dBFS | 0/15 | 0/15 | 100% |
-| -39.5 dBFS | steady noise at -60 dBFS | 15/15 | 8/15 | 8% |
-| -19.5 dBFS | second talker at -40 dBFS | 4/15 | 1/15 | 91% |
-| -39.5 dBFS | second talker at -60 dBFS | 11/15 | 6/15 | 38% |
+| -19.5 dBFS | none | 6/6 | 8.3% | 0.60 s |
+| -19.5 dBFS | steady noise at -40 dBFS | 6/6 | 8.3% | 0.57 s |
+| -39.5 dBFS | none | 6/6 | 8.3% | 0.57 s |
+| -39.5 dBFS | steady noise at -60 dBFS | 6/6 | 8.3% | 0.58 s |
+| -50 dBFS | none | 6/6 | 8.3% | 0.66 s |
+| -50 dBFS | steady noise at -70 dBFS | 6/6 | 8.3% | 0.69 s |
+| -19.5 dBFS | second talker at -40 dBFS | 3/6 | 66.7% | 0.65 s |
+| -39.5 dBFS | second talker at -60 dBFS | 4/6 | 83.3% | 0.63 s |
+| -50 dBFS | second talker at -70 dBFS | 5/6 | 55.6% | 0.70 s |
 
-- **Quiet speech.** The energy detector calls a 20 ms frame speech when its RMS is above 100, which is -50.3 dBFS. From -45 dBFS down the quiet ends of words fall under that and commands are cut short. At -50 dBFS the wake phrase is only heard when the command follows in the same breath (3/3); with any pause it is missed (0/12). Whistle alone still transcribed 9 of those 15 commands exactly from the same captured audio, so the recognizer is not what loses them. A USB microphone at a low input volume lands in this range.
-- **Steady noise.** Noise above the same floor from the start is taken for speech, and the noise estimate only moves on frames that are not speech. Jimmy then waits for half a second of quiet that never comes. All 15 trials produced no event of any kind.
-- **A second talker** 20 dB below the speech cost 11 of 15 wakes at the higher level.
-- **Pause length** made no difference at -39.5 dBFS and above: 3/3 at every pause from 0 to 2.5 s.
-- **Wake confidence** is the lowest word probability of the matched phrase and ranged from 0.09 to 0.87, with a median of 0.50 at the four levels without background. Nothing compares it to a threshold.
-- **False wakes.** None in 3.07 minutes of non-wake speech, which included "Hey, Jamie, did you see the game" and "Jim said the meeting moved".
-- **The recognizer on a whole utterance** often drops or mangles the phrase: "Hey Jimmy" was in the transcript of the captured trial 9/15 times at -19.5 dBFS, 4/15 at -30 dBFS and 0/15 at -39.5 dBFS ("Jimmy, what is the weather", "Hajimi open the list"). Live detection works because it transcribes the first second on its own.
-- **While Jimmy speaks through a speaker the microphone hears**, it transcribes its own voice: a 60 s reply cost 154 CPU-seconds against 68 without the echo. @@BARGEIN@@
+- **Quiet speech & steady noise.** All quiet and steady-noise rows reached `6/6` wake detection and `8.3%` WER (1 word out of 12, Whistle's "pull" -> "poor/Paul/pool" phonetic ambiguity), down from `0/15` on steady `-40 dBFS` noise and `3/15` at `-50 dBFS`.
+- **False wakes.** `0` in 1.06 minutes of non-wake speech at gain 1.0 (which included "Hey, Jamie, did you see the game" and "Jim said the meeting moved").
+- **Second talker.** Foreground surge breakout and peak-level endpoint gating prevent a quieter background talker from locking `wait_silence` or holding a woken turn open to the 25 s cap, though overlapping speech at `-20 dB` still degrades recall and WER when the background talker speaks across the wake phrase itself.
+- **While Jimmy speaks through a speaker the microphone hears**, without echo cancellation it still transcribes its own voice while checking for a wake interruption (a 60 s reply cost 154 CPU-seconds against 68 without the echo).
 
-@@WAKELOAD@@
+### Server, Web, Streaming, and Workspace checks (2026-11-21)
+
+- **Rust workspace:** 56 tests passed (`cargo test --locked --workspace` + Opus feature tests + ignored real-model `pipe_wake` test), Clippy passed with `-D warnings` on default and `--features opus`.
+- **Hallucination guard & follow-up gating:** Verified 6/6 non-speech clips (silence, clicks, 220 Hz bumps, breaths, static bursts, low rumble) return `""` instead of `"Thank you."`, while real spoken `"Thank you."` down to `-50 dBFS` still transcribes cleanly. Follow-up turns gate on the woken speaker's level and consume the window after one turn.
+- **Agent streaming (`jimmy talk`):** Verified live token-by-token streaming on both Codex (`codex app-server --stdio`) and Claude (`--output-format stream-json --verbose --include-partial-messages`) end to end via `scripts/tests/talk.py`.
+- **WebSocket server:** Verified `GET /health`, origin enforcement, `Sec-WebSocket-Protocol` token scoping (rejected on HTTP endpoints, accepted on `/v1/stream`), 80-frame binary audio bursts + priority `cancel` without disconnect, and `0.0 ms` CPU over 1.0 s across 8 idle WebSocket sessions (condvar-blocked workers).
+- **Web package (`jimmy-web` 0.1.1):** Rebuilt WASM core (`jimmy_web.wasm`) and TypeScript bundle; all 3 Node wire/client tests passed (including eager `speakStop` drop).
 
 ## Remaining 1.0 acceptance
 
